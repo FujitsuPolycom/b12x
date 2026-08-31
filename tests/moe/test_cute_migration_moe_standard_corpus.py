@@ -556,6 +556,81 @@ def test_standard_moe_micro_live_graph_oracle(
     )
 
 
+def test_standard_moe_glm53_m1_rowpair_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise GLM-5.3's native M1 row-pair FC2 path through dispatch."""
+
+    num_experts = 16
+    hidden_size = 4096
+    intermediate_size = 512
+    topk = 8
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(
+        device,
+        seed=104,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    initial = _make_inputs(
+        device,
+        m=1,
+        seed=105,
+        route_shift=0,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    changed = _make_inputs(
+        device,
+        m=1,
+        seed=106,
+        route_shift=5,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        topk=topk,
+    )
+    initial_reference = _nvfp4_oracle(
+        weights,
+        initial,
+        quant_scale_math="reciprocal_multiply",
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    changed_reference = _nvfp4_oracle(
+        weights,
+        changed,
+        quant_scale_math="reciprocal_multiply",
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        num_topk=topk,
+    )
+    assert case.scratch_plan.launch_plan.implementation == "micro"
+    assert case.binding.implementation == "micro"
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="standard-moe-glm53-m1-rowpair",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+        replay_count=3,
+        assert_no_replay_allocations=True,
+    )
+
+
 @pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 6])
 def test_standard_moe_qwen38_nvfp4_padding_live_graph_oracle(
     monkeypatch: pytest.MonkeyPatch,
