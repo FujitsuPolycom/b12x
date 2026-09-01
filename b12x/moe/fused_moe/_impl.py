@@ -2077,6 +2077,7 @@ def clear_tp_moe_caches() -> None:
     clear_w4a16_kernel_cache()
     _MICRO_KERNEL_CACHE.clear()
     _DYNAMIC_KERNEL_CACHE.clear()
+    _M8_ROUTE_PACK_KERNEL_CACHE.clear()
     _MAC_CACHE.clear()
     _MICRO_DIRECT_LAUNCH_CAP_CACHE.clear()
     _MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE.clear()
@@ -10248,10 +10249,6 @@ def _get_dynamic_kernel(
     cache_key = (
         quant_mode,
         "dynamic",
-        # The CuTe launch wrapper specializes its grid on this value.  Omitting
-        # it aliases differently sized launches to whichever artifact happened
-        # to compile first, so later MAC overrides are silently ignored.
-        int(mac),
         E,
         k,
         n,
@@ -10981,6 +10978,7 @@ def _launch_dynamic_flat(
         if prepare_mac_override is not None:
             prepare_effective_mac = min(
                 task_capacity,
+                get_num_sm(torch.device("cuda")),
                 max(1, int(prepare_mac_override)),
             )
     compiled = None
@@ -11153,15 +11151,7 @@ def _launch_dynamic_flat(
             m,
             max_rows,
             scatter_rows,
-            physical_tiles_capacity
-            * _select_dynamic_tile_mn(
-                m * num_topk,
-                n,
-                quant_mode,
-                num_experts=E,
-                activation=activation,
-                planned_tile_m=planned_tile_m,
-            )[0],
+            physical_tiles_capacity * selected_tile_m,
             task_capacity,
             physical_tiles_capacity,
             launch_mac,
