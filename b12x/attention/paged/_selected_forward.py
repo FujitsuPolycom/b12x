@@ -1281,7 +1281,7 @@ def precompile_sparse_gqa_split(
     request_ids: torch.Tensor,
     selection_width: int = _SELECTION_WIDTH,
 ) -> None:
-    """Compile a supported specialization without touching runtime storage."""
+    """Compile the caller's planned selection capacity without storage writes."""
     with torch.cuda.device(query.device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(

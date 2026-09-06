@@ -3235,6 +3235,7 @@ class PagedForwardKernel:
         the same BF16 query, paged BF16/FP8 cache, tensor-core QK/PV, and online
         softmax contract while replacing contiguous K-tile traversal with an
         explicit logical-position row resolver.
+        ``selection_width`` is planned column capacity, not a live token count.
         """
         from ._selected_forward import _SelectedPositionPagedForwardKernel
 
