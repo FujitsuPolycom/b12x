@@ -13,6 +13,7 @@ import torch
 
 from .test_kda_prefill import (
     HEAD_DIM,
+    _run as run_op,
     assert_kda_close,
     make_binding,
     make_inputs,
@@ -110,9 +111,8 @@ def test_two_checkpoint_gpu_independent_fp32_oracle(heads, inplace):
         checkpoint_export=True,
         max_checkpoints=2,
     )
-    from b12x.sequence.kda_prefill import _impl as impl
 
-    impl.run(binding)
+    run_op(binding, inputs)
     torch.cuda.synchronize(device)
     assert_dual_oracle(binding, tensors, inputs)
 
@@ -120,7 +120,6 @@ def test_two_checkpoint_gpu_independent_fp32_oracle(heads, inplace):
 @pytest.mark.parametrize("heads", [16, 32], ids=["glm-tp4-heads", "glm-tp2-heads"])
 def test_two_checkpoint_gpu_8k_matches_one_checkpoint_prefixes(heads):
     device = require_gb10()
-    from b12x.sequence.kda_prefill import _impl as impl
 
     inputs = dual_inputs([8192], heads=heads, offsets=[[6144, 7168]], device=device)
     binding, tensors = make_binding(
@@ -130,7 +129,7 @@ def test_two_checkpoint_gpu_8k_matches_one_checkpoint_prefixes(heads):
         checkpoint_export=True,
         max_checkpoints=2,
     )
-    impl.run(binding)
+    run_op(binding, inputs)
     torch.cuda.synchronize(device)
     assert binding.error_code.item() == 0
     for length, slot in ((8192, 1), (6144, 2), (7168, 3)):
@@ -146,7 +145,7 @@ def test_two_checkpoint_gpu_8k_matches_one_checkpoint_prefixes(heads):
         one_checkpoint, one_checkpoint_tensors = make_binding(
             prefix, max_tokens=8192, max_seqs=1
         )
-        impl.run(one_checkpoint)
+        run_op(one_checkpoint, prefix)
         torch.cuda.synchronize(device)
         assert one_checkpoint.error_code.item() == 0
         torch.testing.assert_close(
@@ -188,13 +187,12 @@ def test_two_checkpoint_gpu_frozen_replay_changes_live_counts_and_offsets():
         unfreeze_kernel_resolution,
     )
     from b12x.sequence.kda_prefill import _cute_kernels as kernels
-    from b12x.sequence.kda_prefill import _impl as impl
 
     first = dual_inputs([96], device=device)
     binding, tensors = make_binding(
         first, max_tokens=256, max_seqs=4, checkpoint_export=True, max_checkpoints=2
     )
-    impl.run(binding)
+    run_op(binding, first)
     torch.cuda.synchronize(device)
     launchers = (
         kernels._PROLOGUE_CACHE[kernels._prologue_key(binding)],
@@ -206,7 +204,7 @@ def test_two_checkpoint_gpu_frozen_replay_changes_live_counts_and_offsets():
     try:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            impl.run(binding)
+            run_op(binding, first)
         for lengths, offsets in (
             ([128], [[112, 32]]),
             ([64, 80, 96], [[16, 48], [64, 32], [32, 80]]),
@@ -249,7 +247,6 @@ def test_two_checkpoint_gpu_frozen_replay_changes_live_counts_and_offsets():
 )
 def test_two_checkpoint_gpu_invalid_metadata_preserves_state(fault):
     device = require_gb10()
-    from b12x.sequence.kda_prefill import _impl as impl
 
     inputs = dual_inputs([64], device=device)
     binding, tensors = make_binding(
@@ -269,12 +266,12 @@ def test_two_checkpoint_gpu_invalid_metadata_preserves_state(fault):
         tensors["checkpoint_state_indices"][0, 1] = 16
     before = tensors["recurrent_state"].clone()
     binding.output.fill_(7)
-    impl.run(binding)
+    run_op(binding, inputs)
     torch.cuda.synchronize(device)
     assert binding.error_code.item() != 0
     assert torch.equal(tensors["recurrent_state"], before)
-    assert torch.isnan(binding.output[:64].float()).all()
-    assert torch.all(binding.output[64:] == 7)
+    # Transactional failure poisons the full bound output capacity.
+    assert torch.isnan(binding.output.float()).all()
 
 
 def test_two_checkpoint_gpu_high_pool_offsets():
@@ -283,7 +280,6 @@ def test_two_checkpoint_gpu_high_pool_offsets():
             "set B12X_RUN_LARGE_POOL_TESTS=1 on an idle GB10; requires over 8 GiB"
         )
     device = require_gb10()
-    from b12x.sequence.kda_prefill import _impl as impl
 
     slot_stride = HEAD_DIM * HEAD_DIM + 2048
     high = (1 << 31) // slot_stride + 8
@@ -297,7 +293,7 @@ def test_two_checkpoint_gpu_high_pool_offsets():
     compact, compact_tensors = make_binding(
         inputs, max_tokens=64, max_seqs=1, checkpoint_export=True, max_checkpoints=2
     )
-    impl.run(compact)
+    run_op(compact, inputs)
     torch.cuda.synchronize(device)
     assert compact.error_code.item() == 0
     storage = torch.empty(storage_elements, dtype=torch.float32, device=device)
@@ -322,7 +318,7 @@ def test_two_checkpoint_gpu_high_pool_offsets():
         checkpoint_export=True,
         max_checkpoints=2,
     )
-    impl.run(large)
+    run_op(large, large_inputs)
     torch.cuda.synchronize(device)
     assert large.error_code.item() == 0
     torch.testing.assert_close(large.output, compact.output, rtol=0, atol=0)
