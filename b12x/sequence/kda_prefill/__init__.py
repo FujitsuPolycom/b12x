@@ -11,9 +11,15 @@ The recurrent-state pool uses the ``gdn_decode`` physical layout
 ``[slot, head, value_dim, key_dim]`` in fp32, so a prefill and a decode of the
 same request share one pool without conversion. State slots are addressed by
 index rather than gathered: a request names its initial slot, its final slot,
-and optionally one checkpoint slot with a chunk-aligned token offset, and the
-op reads and writes those slots directly. ``Caps.null_state_index`` may reserve
-one index meaning "zero initial state" and "do not write".
+and optionally checkpoint slots with chunk-aligned token offsets. The op reads
+and writes those slots directly. ``Caps.max_checkpoints`` defaults to one with
+one-checkpoint vector metadata. Explicit ``max_checkpoints=2`` uses contiguous
+``[sequence_capacity, 2]`` checkpoint indices/offsets, requires checkpoint export
+and transactional validation, and exports both states during the same
+recurrence. Two-checkpoint export is research-only: policy validation accepts
+NVIDIA GB10 (SM121, 48 SMs). GPU execution is unqualified; the embedded
+registry has no measured KDA-prefill profile. ``Caps.null_state_index``
+may reserve one index meaning "zero initial state" and "do not write".
 
 Requests are packed. Request ``r`` covers tokens
 ``cu_seqlens[r]:cu_seqlens[r + 1]``; ``num_seqs`` and ``num_tokens`` are device
