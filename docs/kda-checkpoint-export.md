@@ -5,9 +5,13 @@ up to four token offsets during one sequence traversal. A serving scheduler can 
 those saved states to satisfy checkpoint boundaries without splitting the
 model's forward pass at each boundary.
 
-Status: research-only. CPU contract tests pass. GPU execution and throughput
-are unqualified. Planning accepts multi-checkpoint modes on NVIDIA GB10,
-SM121, 48 SMs. The embedded registry contains no measured KDA-prefill profile.
+Status: research-only. Forty-one CPU contract tests and twelve selected
+four-checkpoint GPU tests passed on NVIDIA GB10, SM121, 48 SMs. The GPU checks
+cover one and sixteen local KDA heads, including checkpoint values, graph
+replay, invalid metadata, and high pool addresses. These are bounded correctness
+results; standalone checkpoint-export throughput and an embedded measured
+KDA-prefill policy profile remain unqualified. Exact selections and source
+identities are in the [component evidence](evidence/kda-prefill/gb10-four-checkpoint-20260907/component-checks.json).
 
 ## Checkpoint contract
 
@@ -45,8 +49,10 @@ Each saved state writes `heads * 128 * 128 * 4` bytes: 1 MiB at 16 heads and
 cache pages, export convolution state or publish cache entries. Whole-model
 pass removal requires a serving integration that owns those operations.
 
-Four-slot capacity reserves two more potential state destinations than two-slot
-capacity. At H16, two additional enabled exports write 2 MiB per sequence.
+H16 denotes sixteen local KDA heads processed by one GPU; the 64-head
+GLM-5.3-Flash model has sixteen heads per rank at TP4. Four-slot capacity reserves
+two more potential state destinations than two-slot capacity. At H16, two
+additional enabled exports write 2 MiB per sequence.
 Scratch duplicate-detection capacity grows with the planned count; request
 counts and offsets remain runtime metadata. A vLLM DCP4 integration can retain
 both 512-token and 2048-token replay boundaries without reducing prefix reuse.
@@ -78,32 +84,40 @@ KDA-prefill registration and generator in the planned-op catalog. The catalog
 completeness test fails on that source and on this implementation. The
 component therefore requires catalog/provider integration, schema-3 coverage,
 and measured device profiles, or an explicitly reviewed policy for
-unqualified components. GPU qualification and this catalog dependency are
-required for promotion beyond research-only status.
+unqualified components. This inherited policy-inventory dependency remains
+separate from the bounded GPU correctness results below.
 
 ## Verification commands and coverage
 
 CPU ownership, reference and policy contracts:
 
 ```sh
-python -m pytest tests/sequence/test_kda_prefill_two_checkpoints_cpu.py -q
+.venv/bin/python -m pytest tests/sequence/test_kda_prefill_two_checkpoints_cpu.py -q
 ```
 
-The GPU suite exercises public plan/bind/run operations. Four-slot cases cover
-8192-token exports at 4096, 6144, 7168 and 7680, nonadjacent duplicate offsets,
-frozen replay with changing live metadata, and high pool indices.
+The GPU suite exercises public plan/bind/run operations. The twelve selected
+four-slot cases passed with no selected skips. They cover 8192-token exports
+at 4096, 6144, 7168 and 7680, nonadjacent duplicate offsets, frozen replay with
+changing live metadata, and high pool indices. This command reproduces that
+selection, including its large-pool case:
+
+```sh
+B12X_RUN_LARGE_POOL_TESTS=1 .venv/bin/python -m pytest \
+  tests/sequence/test_kda_prefill_two_checkpoints_gpu.py -k four_checkpoint -q -rs
+```
 
 The two-slot cases compare outputs
 and saved states with an independent FP32 oracle; check in-place initial/final
 storage; compare 8192-token exports at 6144 and 7168 with one-checkpoint
 full/prefix runs; replay CUDA graphs with changing counts, destinations and
 offsets under frozen kernel resolution; check allocator counters and stable
-addresses; and verify transactional rejection.
+addresses; and verify transactional rejection. Those fifteen two-slot cases
+were deselected in the recorded four-slot run. The full-suite command below
+expands coverage beyond the recorded twelve cases:
 
 ```sh
-python -m pytest tests/sequence/test_kda_prefill_two_checkpoints_gpu.py -q -rs
-B12X_RUN_LARGE_POOL_TESTS=1 python -m pytest \
-  tests/sequence/test_kda_prefill_two_checkpoints_gpu.py::test_four_checkpoint_gpu_high_pool_offsets -q -rs
+B12X_RUN_LARGE_POOL_TESTS=1 .venv/bin/python -m pytest \
+  tests/sequence/test_kda_prefill_two_checkpoints_gpu.py -q -rs
 ```
 
 The high-offset pool case reserves over 8 GiB, leaves unrelated pages
@@ -113,14 +127,15 @@ sufficient free memory. Record a skipped case as missing coverage.
 
 | Geometry | Purpose | GPU evidence |
 |---|---|---|
-| H1, D128 | FP32 oracle, metadata/replay and high-offset pool checks | Not executed |
-| H16, D128 | Per-rank KDA geometry for a 64-head model at TP4 | Not executed |
-| H32, D128 | Additional per-rank geometry coverage | Not executed |
+| H1, D128 | One local head: FP32 oracle, invalid metadata and frozen replay | Four-slot cases passed |
+| H16, D128 | Sixteen local heads: FP32 oracle, exact 8K prefix states and high pool offsets | Four-slot cases passed |
+| H32, D128 | Thirty-two local heads: additional component geometry | Unrun; no four-slot qualification |
 
 The serving validation target is GLM-5.3-Flash on four Sparks at TP4. Its KDA
 configuration has 64 heads with dimension 128; the model adapter partitions
-those heads over the TP ranks. H32 component coverage does not qualify a
-multi-GPU serving configuration.
+those heads over the TP ranks. The H32 test geometry does not establish TP2
+serving support. The [serving report](evidence/kda-prefill/gb10-four-checkpoint-20260907/report.md)
+records the separate four-Spark TP4/DCP4 comparison.
 
 ## Switch-connected Spark qualification
 
@@ -133,5 +148,6 @@ backend, switch topology and serving configuration fixed across measurements.
 A performance record must identify the source and toolchain, physical device,
 correctness gates, warmup and graph state, allocation behavior, raw timings and
 ratio direction. Measure checkpoint-export overhead separately from a paired
-whole-model coalescing comparison. The CPU results and GPU test collection in
-this package establish no throughput result.
+whole-model coalescing comparison. The component checks establish the listed
+correctness coverage. The serving measurements belong to the recorded
+B12X/vLLM composition and do not measure standalone checkpoint-export latency.

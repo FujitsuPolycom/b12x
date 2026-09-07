@@ -11,3 +11,5 @@ The tested component revision is `70fe41974ef4b18f61caaa2579c81cdc05d1265f`, bas
 Eligibility remains NVIDIA GB10. These execution/correctness checks are not a measured component-policy profile. KDA catalog/offline-provider integration and embedded measured profiles remain unresolved. The serving smoke tests do not establish full numerical or model-quality equivalence.
 
 Both native vLLM split-page settings were held at 512 in every serving arm: `VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE` and `VLLM_GLM53_SPLIT_MAMBA_BLOCK_SIZE`. They preserve physical/lookup/scheduler alignment `(512, 512, 2048)` and do not require SparkCache. Enabled feature flags were accompanied by request-associated checkpoint/mHC dispatch evidence and completed API requests.
+
+The companion [serving reproduction instructions](https://github.com/FujitsuPolycom/vllm/blob/feat/gb10-continuation-prefill/docs/benchmarking/glm-kda-checkpoints-20260907/reproduction.md) identify the model snapshot, client inputs and public runtime composition.
