@@ -22,12 +22,12 @@ def validate_metadata(
     """Validate packed ownership and return spans without reading state tensors.
 
     Nonpositive offsets disable an entry. A null checkpoint never owns storage;
-    its positive offset still must be aligned and within the request. Two enabled,
+    its positive offset still must be aligned and within the request. Enabled,
     non-null exports need distinct offsets and globally unique destinations.
     Initial may alias only own final.
     """
-    if type(max_checkpoints) is not int or max_checkpoints not in (1, 2):
-        raise ValueError("max_checkpoints must be 1 or 2")
+    if type(max_checkpoints) is not int or max_checkpoints not in (1, 2, 4):
+        raise ValueError("max_checkpoints must be 1, 2 or 4")
     if not 0 <= num_seqs <= seq_capacity or not 0 <= num_tokens <= token_capacity:
         raise ValueError("live counts exceed capacities")
     if int(cu_seqlens[0]) != 0 or int(cu_seqlens[num_seqs]) != num_tokens:
@@ -73,7 +73,7 @@ def validate_metadata(
                 raise ValueError("checkpoint offset out of bounds or unaligned")
             if offset > 0 and not null(slot):
                 if offset in seen_offsets:
-                    raise ValueError("two active checkpoints have the same offset")
+                    raise ValueError("active checkpoints have the same offset")
                 seen_offsets.add(offset)
                 write(slot)
     for seq in range(num_seqs):

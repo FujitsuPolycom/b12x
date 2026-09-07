@@ -1,20 +1,20 @@
-# Two recurrent checkpoints in one KDA prefill
+# Bounded recurrent checkpoints in one KDA prefill
 
 The KDA prefill operation, `b12x.sequence.kda_prefill`, saves recurrent state at
-two token offsets during one sequence traversal. A serving scheduler can use
+up to four token offsets during one sequence traversal. A serving scheduler can use
 those saved states to satisfy checkpoint boundaries without splitting the
 model's forward pass at each boundary.
 
 Status: research-only. CPU contract tests pass. GPU execution and throughput
-are unqualified. Planning accepts the two-checkpoint mode on NVIDIA GB10,
+are unqualified. Planning accepts multi-checkpoint modes on NVIDIA GB10,
 SM121, 48 SMs. The embedded registry contains no measured KDA-prefill profile.
 
 ## Checkpoint contract
 
 A checkpoint is a saved recurrent state after a specified number of request
 tokens. The planned checkpoint capacity, `Caps.max_checkpoints`, defaults to
-`1`, with vector metadata `[sequence_capacity]`. A capacity of `2` uses
-contiguous matrix metadata `[sequence_capacity, 2]` and requires
+`1`, with vector metadata `[sequence_capacity]`. A capacity of `2` or `4` uses
+contiguous matrix metadata `[sequence_capacity, max_checkpoints]` and requires
 `checkpoint_export=True` with transactional metadata validation.
 
 State indices use the same `int32` or `int64` dtype as initial/final state
@@ -24,14 +24,14 @@ and divisible by the recurrence tile size of 16 tokens. The tile size is
 independent of a serving scheduler's token budget.
 
 Nonpositive offsets disable an entry. A null destination does not own storage;
-its positive offset must still be in bounds and aligned. Two active non-null
+its positive offset must still be in bounds and aligned. Active non-null
 exports require distinct offsets and globally unique destinations. Offsets
 may be unordered. An export at the final token boundary is legal if its
 destination differs from the final-state destination.
 
 Initial state may alias its own final slot. Checkpoints may not overwrite an
 initial read, another checkpoint or a final write. Invalid device metadata
-poisons live output, sets the error bits documented by the operation, and
+poisons the full bound output capacity, sets the error bits documented by the operation, and
 leaves the recurrent pool unchanged. A request spanning pipeline windows
 requires a non-null final slot for its running recurrence.
 
@@ -45,12 +45,18 @@ Each saved state writes `heads * 128 * 128 * 4` bytes: 1 MiB at 16 heads and
 cache pages, export convolution state or publish cache entries. Whole-model
 pass removal requires a serving integration that owns those operations.
 
+Four-slot capacity reserves two more potential state destinations than two-slot
+capacity. At H16, two additional enabled exports write 2 MiB per sequence.
+Scratch duplicate-detection capacity grows with the planned count; request
+counts and offsets remain runtime metadata. A vLLM DCP4 integration can retain
+both 512-token and 2048-token replay boundaries without reducing prefix reuse.
+
 ## Planning and device eligibility
 
-Construct `kda_prefill.Caps` with `max_checkpoints=2` and pass it to
+Construct `kda_prefill.Caps` with `max_checkpoints=2` or `4` and pass it to
 `kda_prefill.plan`. The typed component policy validates the normalized device
 identity `nvidia / nvidia gb10 / (12, 1) / 48 SMs` once during planning. Other
-devices receive a planning error for two checkpoints. One-checkpoint planning
+devices receive a planning error for multiple checkpoints. One-checkpoint planning
 retains its device eligibility.
 
 The device restriction defines the validation target. There is no TP-count,
@@ -60,9 +66,9 @@ do not enter policy queries or kernel compile/cache keys: checkpoint capacity
 is planned, while indices, offsets and live token/request counts are runtime
 data. Bind and replay perform no device-eligibility lookup.
 
-Query schema 2 includes `max_checkpoints` for both vector and matrix metadata.
-Config schema 1 describes the launch-config fields. A schema-1 KDA profile is
-incompatible with the schema-2 query contract and is rejected. AUTO and
+Query schema 3 permits `max_checkpoints` values 1, 2 and 4 for vector and matrix metadata.
+Config schema 1 describes the launch-config fields. A schema-1 or schema-2 KDA profile is
+incompatible with the schema-3 query contract and is rejected. AUTO and
 HEURISTIC_ONLY resolve through the component heuristic when the registry has
 no matching KDA profile. PREPLANNED_ONLY rejects that missing qualification.
 Explicit configuration overrides pass the same target validator.
@@ -70,7 +76,7 @@ Explicit configuration overrides pass the same target validator.
 The base source revision, `06b4de7c723e6f166d65abf5909c5b7d0f8acc68`, lacks a
 KDA-prefill registration and generator in the planned-op catalog. The catalog
 completeness test fails on that source and on this implementation. The
-component therefore requires catalog/provider integration, schema-2 coverage,
+component therefore requires catalog/provider integration, schema-3 coverage,
 and measured device profiles, or an explicitly reviewed policy for
 unqualified components. GPU qualification and this catalog dependency are
 required for promotion beyond research-only status.
@@ -83,17 +89,21 @@ CPU ownership, reference and policy contracts:
 python -m pytest tests/sequence/test_kda_prefill_two_checkpoints_cpu.py -q
 ```
 
-The GPU suite exercises public plan/bind/run operations. It compares outputs
-and saved states with an independent FP32 oracle; checks in-place initial/final
-storage; compares 8192-token exports at 6144 and 7168 with one-checkpoint
-full/prefix runs; replays CUDA graphs with changing counts, destinations and
-offsets under frozen kernel resolution; checks allocator counters and stable
-addresses; and verifies transactional rejection.
+The GPU suite exercises public plan/bind/run operations. Four-slot cases cover
+8192-token exports at 4096, 6144, 7168 and 7680, nonadjacent duplicate offsets,
+frozen replay with changing live metadata, and high pool indices.
+
+The two-slot cases compare outputs
+and saved states with an independent FP32 oracle; check in-place initial/final
+storage; compare 8192-token exports at 6144 and 7168 with one-checkpoint
+full/prefix runs; replay CUDA graphs with changing counts, destinations and
+offsets under frozen kernel resolution; check allocator counters and stable
+addresses; and verify transactional rejection.
 
 ```sh
 python -m pytest tests/sequence/test_kda_prefill_two_checkpoints_gpu.py -q -rs
 B12X_RUN_LARGE_POOL_TESTS=1 python -m pytest \
-  tests/sequence/test_kda_prefill_two_checkpoints_gpu.py::test_two_checkpoint_gpu_high_pool_offsets -q -rs
+  tests/sequence/test_kda_prefill_two_checkpoints_gpu.py::test_four_checkpoint_gpu_high_pool_offsets -q -rs
 ```
 
 The high-offset pool case reserves over 8 GiB, leaves unrelated pages

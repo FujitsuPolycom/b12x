@@ -13,10 +13,10 @@ same request share one pool without conversion. State slots are addressed by
 index rather than gathered: a request names its initial slot, its final slot,
 and optionally checkpoint slots with chunk-aligned token offsets. The op reads
 and writes those slots directly. ``Caps.max_checkpoints`` defaults to one with
-one-checkpoint vector metadata. Explicit ``max_checkpoints=2`` uses contiguous
-``[sequence_capacity, 2]`` checkpoint indices/offsets, requires checkpoint export
-and transactional validation, and exports both states during the same
-recurrence. Two-checkpoint export is research-only: policy validation accepts
+one-checkpoint vector metadata. Explicit ``max_checkpoints=2`` or ``4`` uses contiguous
+``[sequence_capacity, max_checkpoints]`` checkpoint indices/offsets, requires
+checkpoint export and transactional validation, and exports the enabled states
+during the same recurrence. Multi-checkpoint export is research-only: policy validation accepts
 NVIDIA GB10 (SM121, 48 SMs). GPU execution is unqualified; the embedded
 registry has no measured KDA-prefill profile. ``Caps.null_state_index``
 may reserve one index meaning "zero initial state" and "do not write".
@@ -31,8 +31,8 @@ Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` -> ``run``. Runtime launches
 use caller-owned scratch, allocate no tensor storage, and are capture safe.
 Device-side validation is transactional: bit 0 reports a duplicate or
 conflicting write slot, bit 1 malformed packed metadata, bit 2 an invalid state
-slot, and bit 3 an unusable checkpoint offset. Any error poisons the live
-output rows without mutating recurrent state.
+slot, and bit 3 an unusable checkpoint offset. Any error poisons the full bound
+output capacity without mutating recurrent state.
 """
 
 from __future__ import annotations

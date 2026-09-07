@@ -14,9 +14,9 @@ K_SPLIT_CHOICES = (1, 2, 4)
 STAGE_CHOICES = (2, 3, 4)
 CHUNK_TOKENS = 16
 
-# Two-checkpoint device eligibility is checked once by the component policy.
+# Multi-checkpoint device eligibility is checked once by the component policy.
 # This identity restricts planning; it is not a measured GPU profile.
-_TWO_CHECKPOINT_TARGET = DeviceIdentity(
+_MULTI_CHECKPOINT_TARGET = DeviceIdentity(
     vendor="nvidia", product_name="NVIDIA GB10",
     compute_capability=(12, 1), sm_count=48,
 )
@@ -153,14 +153,14 @@ def _heuristic(query: KdaPrefillQuery, device) -> KdaPrefillConfig:
 
 
 def _validate(query: KdaPrefillQuery, config: KdaPrefillConfig, device) -> None:
-    if type(query.max_checkpoints) is not int or query.max_checkpoints not in (1, 2):
-        raise ValueError("max_checkpoints must be 1 or 2")
-    if query.max_checkpoints == 2:
+    if type(query.max_checkpoints) is not int or query.max_checkpoints not in (1, 2, 4):
+        raise ValueError("max_checkpoints must be 1, 2 or 4")
+    if query.max_checkpoints > 1:
         if not query.checkpoint_export:
-            raise ValueError("two checkpoints require checkpoint_export")
-        if device != _TWO_CHECKPOINT_TARGET:
+            raise ValueError("multiple checkpoints require checkpoint_export")
+        if device != _MULTI_CHECKPOINT_TARGET:
             raise ValueError(
-                "two-checkpoint KDA prefill supports only NVIDIA GB10 "
+                "multi-checkpoint KDA prefill supports only NVIDIA GB10 "
                 "(SM121, 48 SMs); use max_checkpoints=1 on other devices"
             )
     if config.backend != BACKEND:
@@ -195,7 +195,7 @@ def _validate(query: KdaPrefillQuery, config: KdaPrefillConfig, device) -> None:
 
 KDA_PREFILL_POLICY = ComponentPolicy(
     component_id=KDA_PREFILL,
-    query_schema_version=2,
+    query_schema_version=3,
     config_schema_version=1,
     query_fields=frozenset(
         {

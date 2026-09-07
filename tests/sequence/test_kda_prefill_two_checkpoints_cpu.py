@@ -110,7 +110,7 @@ def test_gb10_two_checkpoint_activation_is_explicit_and_not_qualification():
 
 
 def test_query_schema_includes_planned_checkpoint_capacity_only():
-    assert KDA_PREFILL_POLICY.query_schema_version == 2
+    assert KDA_PREFILL_POLICY.query_schema_version == 3
     assert KDA_PREFILL_POLICY.config_schema_version == 1
     assert set(query().profile_fields()) == KDA_PREFILL_POLICY.query_fields
     assert query(1).profile_fields()["max_checkpoints"] == 1
@@ -123,7 +123,8 @@ def test_query_schema_includes_planned_checkpoint_capacity_only():
     }.isdisjoint(KDA_PREFILL_POLICY.query_fields)
 
 
-def test_schema1_profile_rejected_by_schema2_query_contract():
+@pytest.mark.parametrize("schema", [1, 2])
+def test_schema1_and_schema2_profiles_rejected_by_schema3_query_contract(schema):
     registry = ProfileRegistry()
     registry.register(
         GpuProfile(
@@ -133,7 +134,7 @@ def test_schema1_profile_rejected_by_schema2_query_contract():
             components=(
                 ComponentProfile(
                     component_id="sequence.kda_prefill",
-                    query_schema_version=1,
+                    query_schema_version=schema,
                     config_schema_version=1,
                     rules=(
                         ProfileRule.create(
@@ -173,7 +174,7 @@ def test_caps_reject_invalid_checkpoint_capacity(count):
 def test_two_checkpoint_caps_require_transactional_export(extra):
     kwargs = dict(checkpoint_export=True, metadata_validation="transactional")
     kwargs.update(extra)
-    with pytest.raises(ValueError, match="two checkpoints require"):
+    with pytest.raises(ValueError, match="multiple checkpoints require"):
         impl.Caps(
             device="cuda:0",
             max_tokens=32,
@@ -368,3 +369,102 @@ def test_bind_reports_checkpoint_tensor_contract_before_cross_index_dtype(fault)
                 num_tokens=tensor((1,), torch.int32),
                 output=tensor((32, 1, 128)),
             )
+
+
+@pytest.mark.parametrize("capacity", [2, 4])
+def test_multi_checkpoint_caps_validate_matrix_width_before_live_scalar_dtype(capacity):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    caps = impl.Caps(
+        device="cuda:0",
+        max_tokens=64,
+        max_seqs=2,
+        max_state_slots=16,
+        heads=1,
+        checkpoint_export=True,
+        max_checkpoints=capacity,
+    )
+    plan = impl._materialize_plan(
+        caps, v_split=64, k_split=1, stages=3, window_tiles=4, policy_resolution=None
+    )
+    with FakeTensorMode():
+
+        def tensor(shape, dtype=torch.bfloat16):
+            return torch.empty(shape, device="cuda:0", dtype=dtype)
+
+        # Fake tensors have no distinct device addresses. Stop before alias checks.
+        with pytest.raises((ValueError, TypeError), match="num_tokens must have"):
+            impl.bind(
+                plan,
+                scratch=tensor(plan.scratch_specs()[0].shape, torch.uint8),
+                **{name: tensor((64, 1, 128)) for name in ("q", "k", "v", "raw_g")},
+                raw_beta=tensor((64, 1)),
+                A_log=tensor((1,), torch.float32),
+                dt_bias=tensor((1, 128), torch.float32),
+                recurrent_state=tensor((16, 1, 128, 128), torch.float32),
+                cu_seqlens=tensor((3,), torch.int32),
+                initial_state_indices=tensor((2,), torch.int32),
+                final_state_indices=tensor((2,), torch.int32),
+                checkpoint_state_indices=tensor((2, capacity), torch.int32),
+                checkpoint_offsets=tensor((2, capacity), torch.int32),
+                num_seqs=tensor((1,), torch.int32),
+                num_tokens=tensor((1,), torch.int16),
+                output=tensor((64, 1, 128)),
+            )
+    resolved = PolicyContext.for_identity(GB10, registry=ProfileRegistry()).resolve(
+        KDA_PREFILL_POLICY, query(capacity)
+    )
+    assert resolved.source is PolicySource.HEURISTIC
+    with pytest.raises(ValueError, match="supports only NVIDIA GB10"):
+        PolicyContext.for_identity(None).resolve(KDA_PREFILL_POLICY, query(capacity))
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+def test_four_exports_equal_independent_prefix_recurrences(inplace):
+    inputs = make_inputs(lengths=[80], heads=1, seed=842, state_slots=8)
+    if inplace:
+        inputs["final"][0] = inputs["initial"][0]
+    baseline_output, baseline_pool = run_oracle(inputs)
+    inputs["checkpoint_slots"] = torch.tensor([[2, 3, 4, 5]], dtype=torch.int32)
+    inputs["checkpoint_offsets"] = torch.tensor([[64, 16, 48, 32]], dtype=torch.int32)
+    output, pool = run_oracle(inputs, max_checkpoints=4)
+    torch.testing.assert_close(output, baseline_output, rtol=0, atol=0)
+    torch.testing.assert_close(
+        pool[int(inputs["final"][0])],
+        baseline_pool[int(inputs["final"][0])],
+        rtol=0,
+        atol=0,
+    )
+    for slot, offset in zip((2, 3, 4, 5), (64, 16, 48, 32), strict=True):
+        _, expected, _ = recurrent_kda(
+            *(inputs[name][:offset] for name in ("q", "k", "v", "raw_g", "raw_beta")),
+            inputs["A_log"],
+            inputs["dt_bias"],
+            lower_bound=-5.0,
+            initial_state=inputs["pool"][int(inputs["initial"][0])],
+        )
+        torch.testing.assert_close(pool[slot], expected, rtol=1e-6, atol=1e-9)
+
+
+@pytest.mark.parametrize("fault", ["offset", "slot", "initial"])
+def test_four_checkpoint_nonadjacent_aliases_are_rejected(fault):
+    args = metadata()
+    args.update(
+        cu_seqlens=[0, 80],
+        initial_state_indices=[0],
+        final_state_indices=[1],
+        checkpoint_state_indices=[[2, 3, 4, 5]],
+        checkpoint_offsets=[[16, 32, 48, 64]],
+        num_seqs=1,
+        num_tokens=80,
+        null_state_index=None,
+        max_checkpoints=4,
+    )
+    if fault == "offset":
+        args["checkpoint_offsets"][0][3] = 16
+    elif fault == "slot":
+        args["checkpoint_state_indices"][0][3] = 2
+    else:
+        args["checkpoint_state_indices"][0][3] = 0
+    with pytest.raises(ValueError):
+        validate_metadata(**args)
