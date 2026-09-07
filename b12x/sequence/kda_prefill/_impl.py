@@ -80,10 +80,10 @@ class Caps:
             raise ValueError("metadata_validation must be 'transactional' or 'trusted'")
         object.__setattr__(self, "qk_l2norm", bool(self.qk_l2norm))
         object.__setattr__(self, "checkpoint_export", bool(self.checkpoint_export))
-        if type(self.max_checkpoints) is not int or self.max_checkpoints not in (1, 2):
-            raise ValueError("max_checkpoints must be 1 or 2")
-        if self.max_checkpoints == 2 and (not self.checkpoint_export or self.metadata_validation != "transactional"):
-            raise ValueError("two checkpoints require checkpoint_export and transactional validation")
+        if type(self.max_checkpoints) is not int or self.max_checkpoints not in (1, 2, 4):
+            raise ValueError("max_checkpoints must be 1, 2 or 4")
+        if self.max_checkpoints > 1 and (not self.checkpoint_export or self.metadata_validation != "transactional"):
+            raise ValueError("multiple checkpoints require checkpoint_export and transactional validation")
         if self.null_state_index is not None:
             null = int(self.null_state_index)
             if null < 0 or null >= self.max_state_slots:
@@ -362,7 +362,7 @@ def bind(
     )
     if final_state_indices.stride(0) <= 0:
         raise ValueError("final_state_indices must have a positive stride")
-    checkpoint_shape = (seq_capacity,) if caps.max_checkpoints == 1 else (seq_capacity, 2)
+    checkpoint_shape = (seq_capacity,) if caps.max_checkpoints == 1 else (seq_capacity, caps.max_checkpoints)
     require_tensor("checkpoint_state_indices", checkpoint_state_indices, shape=checkpoint_shape,
                    device=device, dtypes=index_dtypes)
     if not (initial_state_indices.dtype == final_state_indices.dtype == checkpoint_state_indices.dtype):

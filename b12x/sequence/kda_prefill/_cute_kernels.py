@@ -568,12 +568,13 @@ class _PrologueKernel:
                                 elif self._insert(table, checkpoint) != Int32(0):
                                     flags[0] = Int32(1)
                                 if cutlass.const_expr(cp > 0):
-                                    previous_index = cp_index - Int32(1)
-                                    previous_slot = Int64(checkpoint_indices[previous_index])
-                                    previous_offset = checkpoint_offsets[previous_index].to(Int32)
-                                    if not self._is_null(previous_slot):
-                                        if previous_offset == offset:
-                                            flags[3] = Int32(1)
+                                    for previous in cutlass.range_constexpr(cp):
+                                        previous_index = seq * Int32(self.max_checkpoints) + Int32(previous)
+                                        previous_slot = Int64(checkpoint_indices[previous_index])
+                                        previous_offset = checkpoint_offsets[previous_index].to(Int32)
+                                        if not self._is_null(previous_slot):
+                                            if previous_offset == offset:
+                                                flags[3] = Int32(1)
                 cute.arch.atomic_add(hist.iterator + count, Int32(1))
             counts[seq] = count
             seq += Int32(_PROLOGUE_THREADS)
