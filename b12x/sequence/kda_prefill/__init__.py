@@ -16,9 +16,12 @@ and writes those slots directly. ``Caps.max_checkpoints`` defaults to one with
 one-checkpoint vector metadata. Explicit ``max_checkpoints=2`` or ``4`` uses contiguous
 ``[sequence_capacity, max_checkpoints]`` checkpoint indices/offsets, requires
 checkpoint export and transactional validation, and exports the enabled states
-during the same recurrence. Multi-checkpoint export is research-only: policy validation accepts
-NVIDIA GB10 (SM121, 48 SMs). GPU execution is unqualified; the embedded
-registry has no measured KDA-prefill profile. ``Caps.null_state_index``
+during the same recurrence. Multi-checkpoint export is research-only: policy
+validation accepts NVIDIA GB10 (SM121, 48 SMs). Twelve four-checkpoint GPU
+tests passed on GB10, covering checkpoint values, graph replay, invalid metadata,
+and pool addressing. This coverage is not a measured component performance
+profile; the embedded registry has no measured KDA-prefill profile.
+``Caps.null_state_index``
 may reserve one index meaning "zero initial state" and "do not write".
 
 Requests are packed. Request ``r`` covers tokens
