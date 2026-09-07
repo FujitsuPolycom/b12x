@@ -81,7 +81,8 @@ def test_mm_matches_quantized_reference_small_n() -> None:
     torch.manual_seed(20260614)
 
     source, _, packed = _make_inputs(7, 128, 32)
-    actual = mxfp8_linear.mm(source, packed)
+    # The oracle quantizes activations; automatic precision may select W8A16.
+    actual = mxfp8_linear.mm(source, packed, mode="quantized")
     expected = _reference_from_packed(source, packed)
     torch.cuda.synchronize()
 
@@ -265,7 +266,7 @@ def test_blockscaled_mm_accepts_prequantized_mxfp8_and_replays() -> None:
         num_groups=1,
         sf_vec_size=32,
     )
-    expected = blockscaled.mm(source, packed)
+    expected = blockscaled.mm(source, packed, mode="quantized")
     actual_native_scale = blockscaled.mm(
         (source_q.values, source_q.scale_mma),
         packed,
@@ -314,7 +315,7 @@ def test_blockscaled_mm_accepts_compact_mxfp8_scales_with_k_padding() -> None:
         packed,
         out_dtype=torch.bfloat16,
     )
-    expected = blockscaled.mm(source, packed)
+    expected = blockscaled.mm(source, packed, mode="quantized")
 
     assert actual.shape == (6, 40)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
