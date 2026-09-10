@@ -224,6 +224,8 @@ def main():
             else "B12X_DYNAMIC_W4A8_MATERIALIZED"
         )
         os.environ[materialized_env] = str(int(split))
+        if nvfp4:
+            impl._nvfp4_materialized_env_refresh()
         if not nvfp4:
             os.environ["B12X_DYNAMIC_W4A8_SHARE_INPUT"] = str(int(shared))
             os.environ["B12X_DYNAMIC_TILE_MN"] = "64x128" if split else "32x128"
