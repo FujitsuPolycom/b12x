@@ -479,7 +479,7 @@ def test_nvfp4_split_backend_rejects_invalid_materialized_combos() -> None:
     )
     # Accepted: shared-input SiLU grouped route/pack front-end.
     MoEDynamicKernelBackend(**{**base, "share_input_across_experts": True})
-    for _name, bad in [
+    for name, bad in [
         ("grouped-quantized per-route input", {"share_input_across_experts": False}),
         ("relu2 activation", {"activation": "relu2"}),
         ("M32 tile", {"mma_tiler_mn": (32, 128)}),
@@ -487,10 +487,13 @@ def test_nvfp4_split_backend_rejects_invalid_materialized_combos() -> None:
         ("deterministic output", {"deterministic_output": True}),
         ("dynamic down scale", {"dynamic_down_scale": True}),
     ]:
-        with pytest.raises(ValueError):
+        try:
             MoEDynamicKernelBackend(
                 **{**base, "share_input_across_experts": True, **bad}
             )
+            pytest.fail(f"{name}: expected ValueError but construction succeeded")
+        except ValueError:
+            pass
 
 
 if __name__ == "__main__":
