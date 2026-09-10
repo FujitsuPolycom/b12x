@@ -1802,8 +1802,10 @@ def _nvfp4_dynamic_dense_candidate(
     - activation == "silu" (relu2, situ, etc. not yet wired in the phase kernels)
     - k % 128 == 0 (phase kernel K-tile geometry)
     - n % 128 == 0 (phase kernel N-tile geometry)
-    - mma_tiler_mn in {(64, 128), (128, 128)} (the split phase kernels only
-      support M64/M128 source tiles; M16/M32 use monolithic)
+    - mma_tiler_mn == (128, 128).  The M64 source tile is excluded: the phase
+      kernels' 64-row multi-tile specialization is not yet validated and is
+      known-wrong on multi-tile experts, so those shapes keep the monolithic
+      path.
     - work_source != "ready_queue" (streaming work source not yet supported)
     - not deterministic_output (the deterministic reduction is not yet wired)
     """
@@ -1822,7 +1824,7 @@ def _nvfp4_dynamic_dense_candidate(
             activation=activation,
             planned_tile_m=planned_tile_m,
         )
-        in {(64, 128), (128, 128)}
+        == (128, 128)
         and _dynamic_work_source() != "ready_queue"
     )
 
@@ -2118,7 +2120,7 @@ def _nvfp4_dynamic_materialized_enabled(
     )
     full_candidate = dense_candidate and share_input_across_experts
     env_flagged = _env_flag(_DYNAMIC_NVFP4_MATERIALIZED_ENV, default=full_candidate)
-    if env_flagged and not (dense_candidate and share_input_across_experts):
+    if env_flagged and not full_candidate:
         logger.info(
             "NVFP4 split-materialized env flag set but predicate false — "
             "falling back to monolithic; "
@@ -2127,11 +2129,7 @@ def _nvfp4_dynamic_materialized_enabled(
             f"quant_mode={quant_mode}, activation={activation}, "
             f"k={k}, n={n}"
         )
-    return bool(
-        dense_candidate
-        and share_input_across_experts
-        and env_flagged
-    )
+    return bool(full_candidate and env_flagged)
 
 
 _WEIGHT_CACHE: Dict[Tuple[int, int, int], _WeightViews] = {}
@@ -3884,6 +3882,7 @@ def _plan_core_workspace(
         k=k,
         n=n,
         deterministic_output=deterministic_output,
+        planned_tile_m=dynamic_tile_m,
     ) and _env_flag(_DYNAMIC_NVFP4_MATERIALIZED_ENV, default=True):
         materialized_intermediate_bytes = max(
             16,
@@ -11251,8 +11250,8 @@ def _launch_dynamic_flat(
         )
         if available_intermediate_bytes < required_intermediate_bytes:
             raise ValueError(
-                "dynamic W4A8 materialized scratch exceeds preplanned capacity: "
-                f"need {required_intermediate_bytes} bytes, have "
+                f"dynamic {quant_mode} materialized scratch exceeds preplanned "
+                f"capacity: need {required_intermediate_bytes} bytes, have "
                 f"{available_intermediate_bytes}; physical_tiles_capacity="
                 f"{physical_tiles_capacity}, selected_tile_m={selected_tile_m}, "
                 f"n={n}, routed_rows={routed_rows}, m={m}, num_topk={num_topk}"
