@@ -46,9 +46,7 @@ _TILE_N = 128
 
 
 def _fake_i32(shape):
-    return cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, shape, assumed_align=4
-    )
+    return cute.runtime.make_fake_compact_tensor(cutlass.Int32, shape, assumed_align=4)
 
 
 def _fake_f32(shape):
@@ -206,9 +204,7 @@ def _compile_launch(domain, *, materialize: bool, spec_name: str):
         _fake_f32((E,)),
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),
-        make_ptr(
-            cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16
-        ),
+        make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
         1,
         1,
         1,
@@ -232,9 +228,7 @@ def _compile_launch(domain, *, materialize: bool, spec_name: str):
 
 
 def _make_launcher(compiled, domain, ws, scales=None):
-    E, K, n = domain["E"], domain["K"], domain["n"]
     m, top_k = domain["m"], domain["top_k"]
-    w1_n = domain["w1_n"]
     weight_dtype = cutlass.Float4E2M1FN
     sf_dtype = cutlass.Float8E4M3FN
     flat_ids = domain["topk_ids"].reshape(-1).contiguous()
@@ -369,12 +363,28 @@ def test_nvfp4_split_matches_monolithic_backend() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_nvfp4_split_cuda_graph_replay_bitwise_and_allocations() -> None:
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,tokens",
+    [(256, 128, 64), (2560, 640, 1025)],
+    ids=["compact", "qwen-tp1-five-intermediate-tiles"],
+)
+def test_nvfp4_split_cuda_graph_replay_bitwise_and_allocations(
+    hidden_size: int,
+    intermediate_size: int,
+    tokens: int,
+) -> None:
     """Capture cooperative+phase1+phase2 in one graph; replays are bitwise
     identical (top-k=1: one atomic producer per output byte) and allocate
     nothing."""
     require_b12x()
-    domain = _build_domain(E=8, K=256, n=128, m=64, top_k=1, seed=24)
+    domain = _build_domain(
+        E=8,
+        K=hidden_size,
+        n=intermediate_size,
+        m=tokens,
+        top_k=1,
+        seed=24,
+    )
     ws = _split_workspace(domain)
     compiled = _compile_launch(
         domain,
@@ -408,8 +418,7 @@ def test_nvfp4_split_cuda_graph_replay_bitwise_and_allocations() -> None:
         ), f"replay {replay_idx} is not bitwise identical"
     after = torch.cuda.memory_allocated()
     assert before == after, (
-        "CUDA-graph replay allocated new device memory "
-        f"({before} -> {after} bytes)"
+        f"CUDA-graph replay allocated new device memory ({before} -> {after} bytes)"
     )
 
 
@@ -470,7 +479,7 @@ def test_nvfp4_split_backend_rejects_invalid_materialized_combos() -> None:
     )
     # Accepted: shared-input SiLU grouped route/pack front-end.
     MoEDynamicKernelBackend(**{**base, "share_input_across_experts": True})
-    for name, bad in [
+    for _name, bad in [
         ("grouped-quantized per-route input", {"share_input_across_experts": False}),
         ("relu2 activation", {"activation": "relu2"}),
         ("M32 tile", {"mma_tiler_mn": (32, 128)}),
@@ -479,7 +488,9 @@ def test_nvfp4_split_backend_rejects_invalid_materialized_combos() -> None:
         ("dynamic down scale", {"dynamic_down_scale": True}),
     ]:
         with pytest.raises(ValueError):
-            MoEDynamicKernelBackend(**{**base, "share_input_across_experts": True, **bad})
+            MoEDynamicKernelBackend(
+                **{**base, "share_input_across_experts": True, **bad}
+            )
 
 
 if __name__ == "__main__":

@@ -1,9 +1,14 @@
-"""Compare NVFP4 routed-input sharing and split compute through serving bindings.
+"""Compare routed-input sharing and split MoE compute through serving bindings.
 
-Synthetic GLM-5.3 TP4 experts have K4096, I512, E288, and top-8 routing.
+The default synthetic NVFP4 geometry is GLM-5.3 TP4: K4096/I512/E288/top8.
+Qwen TP1 uses K2560/I640/E512/top10. DS4 TP2 uses K4096/I1024/E256/top6
+with --recipe w4a8_mx (MXFP4 weights and MXFP8 activations).
 Every arm uses identical source tensors, caller-owned scratch, and fresh bindings.
-The per-expert control disables only the preparation-time equality proof; its
-scale vectors are unchanged. CUDA-event samples alternate arm order and include
+For NVFP4 the per-expert control disables only the preparation-time equality
+proof; its scale vectors are unchanged. MXFP4 compares fused M32 against split
+M64, including their different tile geometry. Synthetic SiLU is unclamped;
+the DS4 checkpoint's clamp of 10 requires a separate serving check.
+CUDA-event samples alternate arm order and include
 an optional L2 flush outside the timed region. Results are kernel diagnostics,
 not model-serving throughput.
 """
@@ -13,7 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import fields, replace
 import json
 import os
 from pathlib import Path
@@ -25,13 +30,19 @@ from unittest.mock import patch
 import torch
 
 from b12x.moe import fused_moe
+from b12x.policy import MOE_DECODE, get_auto_policy
 from b12x.moe.fused_moe import _impl as impl
-from b12x.moe._shared.kernels.reference import compare_to_reference
+from b12x.moe._shared.kernels.reference import (
+    compare_to_reference,
+    moe_reference_w4a8_mx,
+)
+from benchmarks.benchmark_ds4_moe import make_synthetic_mxfp4_moe
 from tests._reference.helpers import prepare_tp_moe_fp4_experts
 from tests.moe.test_cute_migration_moe_standard_corpus import (
     _make_inputs,
     _make_nvfp4_weights,
     _nvfp4_oracle,
+    _Weights,
 )
 
 
@@ -64,6 +75,7 @@ def compare(actual, expected):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--recipe", choices=("nvfp4", "w4a8_mx"), default="nvfp4")
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--experts", type=int, default=288)
     parser.add_argument("--hidden-size", type=int, default=4096)
@@ -104,14 +116,34 @@ def main():
         args.output.write_text(json.dumps(report, indent=2) + "\n")
 
     save()
-    weights = _make_nvfp4_weights(device, seed=353, **geometry)
-    # Non-unit but exactly uniform vectors exercise the serving representation
-    # independently of the model's calibrated activation range.
-    weights = replace(
-        weights,
-        a1_scale=torch.full((args.experts,), 1.25, device=device),
-        a2_scale=torch.full((args.experts,), 0.75, device=device),
-    )
+    nvfp4 = args.recipe == "nvfp4"
+    if nvfp4:
+        weights = _make_nvfp4_weights(device, seed=353, **geometry)
+        # Non-unit uniform vectors exercise the serving representation without
+        # changing the calibrated scales of a checkpoint.
+        weights = replace(
+            weights,
+            a1_scale=torch.full((args.experts,), 1.25, device=device),
+            a2_scale=torch.full((args.experts,), 0.75, device=device),
+        )
+    else:
+        source = make_synthetic_mxfp4_moe(
+            args.experts,
+            args.hidden_size,
+            args.intermediate_size,
+            seed=353,
+            device=device,
+        )
+        weights = _Weights(
+            w1_fp4=source["w13_fp4"],
+            w1_scale=source["w13_mx"],
+            w1_alpha=source["alphas"],
+            a1_scale=source["input_scale"],
+            w2_fp4=source["w2_fp4"],
+            w2_scale=source["w2_mx"],
+            w2_alpha=source["alphas"],
+            a2_scale=source["input_scale"],
+        )
     inputs = _make_inputs(
         device,
         m=args.tokens,
@@ -121,15 +153,16 @@ def main():
         hidden_size=args.hidden_size,
         topk=args.topk,
     )
-    print("Computing independent NVFP4 oracle", flush=True)
+    print(f"Computing independent {args.recipe} oracle", flush=True)
     reference_identity = {
         **geometry,
+        "recipe": args.recipe,
         "tokens": args.tokens,
         "topk": args.topk,
         "weight_seed": 353,
         "input_seed": 354,
-        "a1": 1.25,
-        "a2": 0.75,
+        "a1": 1.25 if nvfp4 else 1.0,
+        "a2": 0.75 if nvfp4 else 1.0,
         "oracle_sha256": hashlib.sha256(
             (
                 Path(impl.__file__).parents[1] / "_shared/kernels/reference.py"
@@ -138,10 +171,31 @@ def main():
     }
     if args.reference_file is not None and args.reference_file.exists():
         cached = torch.load(args.reference_file, map_location="cpu", weights_only=True)
+        # Files written before recipe selection represented only NVFP4.
+        cached["identity"].setdefault("recipe", "nvfp4")
         assert cached["identity"] == reference_identity
         reference = cached["reference"].to(device)
     else:
-        reference = _nvfp4_oracle(weights, inputs, **geometry)
+        if nvfp4:
+            reference = _nvfp4_oracle(weights, inputs, **geometry)
+        else:
+            reference = moe_reference_w4a8_mx(
+                inputs.a.float(),
+                weights.w1_fp4,
+                weights.w1_scale,
+                None,
+                weights.w1_alpha,
+                weights.w2_fp4,
+                weights.w2_scale,
+                None,
+                weights.w2_alpha,
+                inputs.topk_ids,
+                inputs.topk_weights,
+                args.experts,
+                args.hidden_size,
+                args.intermediate_size,
+                activation="silu",
+            )
         if args.reference_file is not None:
             torch.save(
                 {"identity": reference_identity, "reference": reference.cpu()},
@@ -156,40 +210,79 @@ def main():
         ("shared-input-monolithic", True, False),
         ("shared-input-split", True, True),
     )
+    if not nvfp4:
+        # The prepared MXFP4 layout supports fused M32 or split M64 prefill,
+        # not a monolithic M64 kernel. This comparison includes tile geometry.
+        arm_specs = (
+            ("shared-input-fused-m32", True, False),
+            ("shared-input-split-m64", True, True),
+        )
     for name, shared, split in arm_specs[:1] if args.baseline_only else arm_specs:
-        os.environ["B12X_NVFP4_DYNAMIC_MATERIALIZED"] = str(int(split))
+        materialized_env = (
+            "B12X_NVFP4_DYNAMIC_MATERIALIZED"
+            if nvfp4
+            else "B12X_DYNAMIC_W4A8_MATERIALIZED"
+        )
+        os.environ[materialized_env] = str(int(split))
+        if not nvfp4:
+            os.environ["B12X_DYNAMIC_W4A8_SHARE_INPUT"] = str(int(shared))
+            os.environ["B12X_DYNAMIC_TILE_MN"] = "64x128" if split else "32x128"
+        # MXFP4 preparation reuses checkpoint storage for its runtime layout.
+        # Give each arm private source allocations; the oracle used originals.
+        owned = (
+            weights
+            if nvfp4
+            else replace(
+                weights,
+                **{f.name: getattr(weights, f.name).clone() for f in fields(weights)},
+            )
+        )
         experts = prepare_tp_moe_fp4_experts(
             a=inputs.a,
-            a1_gscale=weights.a1_scale,
-            w1_fp4=weights.w1_fp4,
-            w1_blockscale=weights.w1_scale,
-            w1_alphas=weights.w1_alpha,
-            a2_gscale=weights.a2_scale,
-            w2_fp4=weights.w2_fp4,
-            w2_blockscale=weights.w2_scale,
-            w2_alphas=weights.w2_alpha,
-            quant_mode="nvfp4",
-            source_format="modelopt_nvfp4",
+            a1_gscale=owned.a1_scale,
+            w1_fp4=owned.w1_fp4,
+            w1_blockscale=owned.w1_scale,
+            w1_alphas=owned.w1_alpha,
+            a2_gscale=owned.a2_scale,
+            w2_fp4=owned.w2_fp4,
+            w2_blockscale=owned.w2_scale,
+            w2_alphas=owned.w2_alpha,
+            quant_mode=args.recipe,
+            source_format="modelopt_nvfp4" if nvfp4 else "fp4_e8m0_k32",
         )
-        if hasattr(experts, "immutable_input_scales"):
+        if nvfp4 and hasattr(experts, "immutable_input_scales"):
             experts = replace(experts, immutable_input_scales=True)
             assert experts.can_share_input(input_scales_static=True)
-        else:
+        elif nvfp4:
             assert args.baseline_only
-        assert experts.a1_gscale.data_ptr() == weights.a1_scale.data_ptr()
+        assert experts.a1_gscale.data_ptr() == owned.a1_scale.data_ptr()
+        policy = get_auto_policy(device)
+        if not nvfp4:
+            policy = policy.with_override(
+                MOE_DECODE,
+                fused_moe.MoeDecodeConfig(
+                    backend="dynamic",
+                    route_planner="internal",
+                    max_active_clusters=None,
+                    dynamic_tile_m=64 if split else 32,
+                    dynamic_route_mode="grouped",
+                ),
+            )
         plan = fused_moe.plan(
             fused_moe.Caps(
                 max_tokens=args.tokens,
                 num_topk=args.topk,
                 device=device,
                 weight_plan=experts.plan,
-                quant_mode="nvfp4",
+                quant_mode=args.recipe,
+                policy_context=policy,
                 core_token_counts=(args.tokens,),
                 frozen=True,
             )
         )
         config = plan.launch_plan.policy_resolution.config
-        assert config.backend == "dynamic" and config.dynamic_tile_m == 128, config
+        assert config.backend == "dynamic", config
+        assert config.dynamic_tile_m == (128 if nvfp4 else 64 if split else 32), config
         scratch = tuple(
             torch.empty(spec.shape, dtype=spec.dtype, device=device)
             for spec in plan.scratch_specs()
@@ -197,7 +290,7 @@ def main():
         output = torch.empty_like(inputs.a)
 
         def execute():
-            if shared:
+            if shared and nvfp4:
                 assert experts.can_share_input(input_scales_static=True), (
                     "sharing invalidated before bind",
                     experts._a1_scale_version,
@@ -217,14 +310,14 @@ def main():
             # Preserve the zero-copy direct-scale contract in all three arms.
             assert binding.input_gs.data_ptr() == experts.a1_gscale.data_ptr()
             assert binding.down_input_scale.data_ptr() == experts.a2_gscale.data_ptr()
-            if shared:
+            if shared and nvfp4:
                 assert experts.can_share_input(input_scales_static=True), (
                     "sharing invalidated by bind",
                     experts._a1_scale_version,
                     experts.a1_gscale._version,
                 )
             fused_moe.run(binding=binding)
-            if shared:
+            if shared and nvfp4:
                 assert experts.can_share_input(input_scales_static=True), (
                     "sharing invalidated by run",
                     experts._a1_scale_version,
@@ -239,16 +332,18 @@ def main():
             "samples_ms": [],
         }
         report["arms"].append(row)
+        row["comparison_reference_arm"] = arm_specs[0][0]
         save()
         print(f"Warmup {name}", flush=True)
         choice = (
             nullcontext()
-            if shared or not hasattr(experts, "can_share_input")
+            if shared or not nvfp4 or not hasattr(experts, "can_share_input")
             else patch.object(
                 impl.B12XFP4ExpertWeights, "can_share_input", return_value=False
             )
         )
-        gate = getattr(impl, "_nvfp4_dynamic_materialized_enabled", None)
+        gate_name = f"_{'nvfp4' if nvfp4 else 'w4a8'}_dynamic_materialized_enabled"
+        gate = getattr(impl, gate_name, None)
         seen = []
         compile_kernel = impl.b12x_compile
 
@@ -275,9 +370,7 @@ def main():
         gate_observer = (
             nullcontext()
             if gate is None
-            else patch.object(
-                impl, "_nvfp4_dynamic_materialized_enabled", observed_gate
-            )
+            else patch.object(impl, gate_name, observed_gate)
         )
         with (
             choice,
@@ -305,10 +398,16 @@ def main():
             assert row["oracle"]["normalized_rmse"] <= 0.03, row
             if baseline is None:
                 baseline = output.clone()
-            row["against_per_expert"] = compare(output, baseline)
-            row["per_expert_strict_parity_pass"] = (
-                row["against_per_expert"]["cosine"] >= 0.9999
-                and row["against_per_expert"]["normalized_rmse"] <= 0.015
+            comparison_key = "against_per_expert" if nvfp4 else "against_fused_m32"
+            parity_key = (
+                "per_expert_strict_parity_pass"
+                if nvfp4
+                else "fused_m32_strict_parity_pass"
+            )
+            row[comparison_key] = compare(output, baseline)
+            row[parity_key] = (
+                row[comparison_key]["cosine"] >= 0.9999
+                and row[comparison_key]["normalized_rmse"] <= 0.015
             )
             save()
             # Record exact-reference and cross-kernel parity independently.
@@ -341,12 +440,19 @@ def main():
             if event.device_type == torch.autograd.DeviceType.CUDA
         ]
         save()
+        phase_prefix = "Nvfp4" if nvfp4 else "W4A8"
         assert (
-            any("Nvfp4MaterializedPhase1" in n for n in row["cuda_kernel_names"])
+            any(
+                f"{phase_prefix}MaterializedPhase1" in n
+                for n in row["cuda_kernel_names"]
+            )
             == split
         ), row
         assert (
-            any("Nvfp4MaterializedPhase2" in n for n in row["cuda_kernel_names"])
+            any(
+                f"{phase_prefix}MaterializedPhase2" in n
+                for n in row["cuda_kernel_names"]
+            )
             == split
         ), row
         graphs.append(graph)

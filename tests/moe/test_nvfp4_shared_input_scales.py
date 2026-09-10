@@ -108,6 +108,38 @@ def test_scalar_preserves_existing_shared_input_contract():
     assert owner.can_share_input(input_scales_static=False)
 
 
+@pytest.mark.parametrize(
+    "quant_mode,intermediate_size,expected",
+    [
+        ("nvfp4", 640, True),
+        ("nvfp4", 320, False),
+        ("w4a16", 640, False),
+        ("w4a8_mx", 640, False),
+    ],
+    ids=["qwen-target-tp1", "qwen-target-tp2", "qwen-draft", "mxfp4"],
+)
+def test_shared_scales_preserve_recipe_and_intermediate_tile_guards(
+    monkeypatch, quant_mode, intermediate_size, expected
+):
+    """An equality proof cannot override FP4 recipe or phase-tile constraints."""
+    monkeypatch.setenv("B12X_NVFP4_DYNAMIC_MATERIALIZED", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", "persistent_grid")
+    assert (
+        impl._nvfp4_dynamic_materialized_enabled(
+            quant_mode=quant_mode,
+            activation="silu",
+            routed_rows=4096 * 10,
+            num_experts=512,
+            k=2560,
+            n=intermediate_size,
+            share_input_across_experts=True,
+            deterministic_output=False,
+            planned_tile_m=128,
+        )
+        is expected
+    )
+
+
 def test_dynamic_launch_schema_marks_weights_and_scales_read_only():
     schema = torch.ops.b12x.tp_moe_dynamic_launch.default._schema
     arguments = {argument.name: argument for argument in schema.arguments}
