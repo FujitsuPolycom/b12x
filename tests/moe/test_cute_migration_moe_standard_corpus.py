@@ -1005,6 +1005,7 @@ def test_standard_moe_dynamic_scale_graph_reads_canonical_owner_updates(
     _reset_dispatch_environment(monkeypatch)
     monkeypatch.setenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
     monkeypatch.setenv("B12X_DYNAMIC_EXTERNAL_ROUTE_PLAN", "1")
+    monkeypatch.setenv("B12X_DYNAMIC_DIRECT_EXPERT_SCALES", "1")
     monkeypatch.setenv("B12X_DYNAMIC_WORK_SOURCE", work_source)
     geometry = dict(num_experts=32, hidden_size=512, intermediate_size=128)
     weights = _make_nvfp4_weights(device, seed=241, **geometry)
