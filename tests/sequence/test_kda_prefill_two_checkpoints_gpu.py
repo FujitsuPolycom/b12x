@@ -196,6 +196,7 @@ def test_two_checkpoint_gpu_frozen_replay_changes_live_counts_and_offsets():
         unfreeze_kernel_resolution,
     )
     from b12x.sequence.kda_prefill import _cute_kernels as kernels
+
     first = checkpoint_inputs([96], device=device)
     binding, tensors = make_binding(
         first, max_tokens=256, max_seqs=4, checkpoint_export=True, max_checkpoints=2
@@ -333,7 +334,9 @@ def test_two_checkpoint_gpu_high_pool_offsets():
         )
 
 
-@pytest.mark.parametrize("heads", [1, 16], ids=["minimal", "glm-tp4-heads"])
+@pytest.mark.parametrize(
+    "heads", [1, 16, 32], ids=["minimal", "glm-tp4-heads", "glm-tp2-heads"]
+)
 @pytest.mark.parametrize("inplace", [False, True])
 def test_four_checkpoint_gpu_independent_fp32_oracle(heads, inplace):
     device = require_gb10()
@@ -354,11 +357,12 @@ def test_four_checkpoint_gpu_independent_fp32_oracle(heads, inplace):
     assert_checkpoint_oracle(binding, tensors, inputs)
 
 
-def test_four_checkpoint_gpu_8k_matches_fine_and_coarse_prefixes():
+@pytest.mark.parametrize("heads", [16, 32], ids=["glm-tp4-heads", "glm-tp2-heads"])
+def test_four_checkpoint_gpu_8k_matches_fine_and_coarse_prefixes(heads):
     device = require_gb10()
     positions = (4096, 6144, 7168, 7680)
     inputs = checkpoint_inputs(
-        [8192], heads=16, capacity=4, offsets=[list(positions)], device=device
+        [8192], heads=heads, capacity=4, offsets=[list(positions)], device=device
     )
     binding, tensors = make_binding(
         inputs, max_tokens=8192, max_seqs=1, checkpoint_export=True, max_checkpoints=4
