@@ -666,6 +666,9 @@ def _compress_completed_groups_kernel(
     COMPRESS_RATIO: tl.constexpr,
     RING_CAPACITY: tl.constexpr,
     COMPRESSED_PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     POSITION_AXES: tl.constexpr,
     MROPE_INTERLEAVED: tl.constexpr,
     MROPE_SECTION_0: tl.constexpr,
@@ -685,7 +688,16 @@ def _compress_completed_groups_kernel(
         other=-1,
     ).to(tl.int64)
     valid_state_slot = (state_slot >= 0) & (state_slot < MAX_RAW_STATE_SLOTS)
-    complete = ((position + 1) % COMPRESS_RATIO) == 0
+    group_id = position // COMPRESS_RATIO
+    if DCP_SIZE == 1:
+        complete = ((position + 1) % COMPRESS_RATIO) == 0
+    else:
+        group_interleave = CP_INTERLEAVE // COMPRESS_RATIO
+        dcp_round = DCP_SIZE * group_interleave
+        owner = (group_id // group_interleave) % DCP_SIZE
+        complete = (((position + 1) % COMPRESS_RATIO) == 0) & (
+            owner == DCP_RANK
+        )
     if real_request & complete & valid_state_slot:
         request_start = tl.load(query_start_loc + request).to(tl.int64)
         current_first = tl.load(query_positions + request_start).to(tl.int64)
@@ -808,9 +820,15 @@ def _compress_completed_groups_kernel(
         else:
             rotated = normalized * cosine + rotated_partner * sine
         representative = tl.where(in_rotary, rotated, normalized)
-        group_id = position // COMPRESS_RATIO
-        logical_page = group_id // COMPRESSED_PAGE_SIZE
-        page_offset = group_id % COMPRESSED_PAGE_SIZE
+        if DCP_SIZE == 1:
+            local_group = group_id
+        else:
+            local_group = (
+                (group_id // dcp_round) * group_interleave
+                + group_id % group_interleave
+            )
+        logical_page = local_group // COMPRESSED_PAGE_SIZE
+        page_offset = local_group % COMPRESSED_PAGE_SIZE
         table_offset = (request * compressed_table_stride + logical_page).to(tl.int64)
         physical_page = tl.load(compressed_block_table + table_offset).to(tl.int64)
         valid_page = (physical_page >= 0) & (physical_page < num_compressed_pages)
@@ -953,6 +971,9 @@ def _score_representatives_kernel(
     INDEX_HEAD_DIM: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     COMPRESSED_PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     BLOCK_G: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -967,10 +988,22 @@ def _score_representatives_kernel(
         mask=real_request,
         other=0,
     ).to(tl.int64)
-    eligible = tl.minimum(
+    global_eligible = tl.minimum(
         (position + 1) // COMPRESS_RATIO,
         sequence_length // COMPRESS_RATIO,
     )
+    if DCP_SIZE == 1:
+        eligible = global_eligible
+    else:
+        group_interleave = CP_INTERLEAVE // COMPRESS_RATIO
+        dcp_round = DCP_SIZE * group_interleave
+        complete_rounds = global_eligible // dcp_round
+        remainder = global_eligible - complete_rounds * dcp_round
+        rank_remainder = tl.minimum(
+            tl.maximum(remainder - DCP_RANK * group_interleave, 0),
+            group_interleave,
+        )
+        eligible = complete_rounds * group_interleave + rank_remainder
     eligible = tl.minimum(eligible, MAX_GROUPS)
     eligible = tl.where(real_request, eligible, 0)
     prior_eligible = tl.minimum(eligible, GROUP_OFFSET)
@@ -1152,6 +1185,9 @@ def _expand_selected_groups_kernel(
     GROUP_BUDGET: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     SELECTION_WIDTH: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -1170,13 +1206,30 @@ def _expand_selected_groups_kernel(
     expanded = group_ids * COMPRESS_RATIO + columns % COMPRESS_RATIO
     position = tl.load(query_positions + row).to(tl.int64)
     tail_start = ((position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
-    tail_length = position + 1 - tail_start
+    if DCP_SIZE == 1:
+        local_tail_start = tail_start
+        tail_length = position + 1 - tail_start
+    else:
+        global_tail_group = tail_start // COMPRESS_RATIO
+        group_interleave = CP_INTERLEAVE // COMPRESS_RATIO
+        dcp_round = DCP_SIZE * group_interleave
+        tail_owner = (global_tail_group // group_interleave) % DCP_SIZE
+        local_tail_group = (
+            (global_tail_group // dcp_round) * group_interleave
+            + global_tail_group % group_interleave
+        )
+        local_tail_start = local_tail_group * COMPRESS_RATIO
+        tail_length = tl.where(
+            tail_owner == DCP_RANK,
+            position + 1 - tail_start,
+            0,
+        )
     tail_column = columns - expanded_count
     in_tail = (tail_column >= 0) & (tail_column < tail_length)
     result = tl.where(
         columns < expanded_count,
         expanded,
-        tl.where(in_tail, tail_start + tail_column, -1),
+        tl.where(in_tail, local_tail_start + tail_column, -1),
     )
     result = tl.where(status == 0, result, -1)
     tl.store(
@@ -1201,6 +1254,74 @@ def _poison_failed_rows_kernel(
         tl.store(output + row * elements_per_row + offsets, float("nan"), mask=mask)
 
 
+@triton.jit
+def _expand_global_selected_groups_kernel(
+    topk_group_ids,
+    query_positions,
+    selected_positions,
+    topk_row_stride,
+    selected_row_stride,
+    GROUP_BUDGET: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    SELECTION_WIDTH: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.arange(0, BLOCK_W)
+    column_mask = columns < SELECTION_WIDTH
+    group_columns = columns // COMPRESS_RATIO
+    global_group = tl.load(
+        topk_group_ids + row * topk_row_stride + group_columns,
+        mask=column_mask & (group_columns < GROUP_BUDGET),
+        other=-1,
+    ).to(tl.int64)
+    group_interleave = CP_INTERLEAVE // COMPRESS_RATIO
+    dcp_round = DCP_SIZE * group_interleave
+    safe_group = tl.maximum(global_group, 0)
+    owner = (safe_group // group_interleave) % DCP_SIZE
+    local_group = (
+        (safe_group // dcp_round) * group_interleave
+        + safe_group % group_interleave
+    )
+    expanded = local_group * COMPRESS_RATIO + columns % COMPRESS_RATIO
+    selected = tl.where(
+        (columns < GROUP_BUDGET * COMPRESS_RATIO)
+        & (global_group >= 0)
+        & (owner == DCP_RANK),
+        expanded,
+        -1,
+    )
+
+    position = tl.load(query_positions + row).to(tl.int64)
+    global_tail_start = ((position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
+    global_tail_group = global_tail_start // COMPRESS_RATIO
+    tail_owner = (global_tail_group // group_interleave) % DCP_SIZE
+    local_tail_group = (
+        (global_tail_group // dcp_round) * group_interleave
+        + global_tail_group % group_interleave
+    )
+    tail_column = columns - GROUP_BUDGET * COMPRESS_RATIO
+    tail_length = position + 1 - global_tail_start
+    in_tail = (
+        (tail_owner == DCP_RANK)
+        & (tail_column >= 0)
+        & (tail_column < tail_length)
+    )
+    selected = tl.where(
+        in_tail,
+        local_tail_group * COMPRESS_RATIO + tail_column,
+        selected,
+    )
+    tl.store(
+        selected_positions + row * selected_row_stride + columns,
+        selected,
+        mask=column_mask,
+    )
+
+
 _SUPPORT_KERNEL_KEYS = {
     _accumulate_request_errors_kernel: '_accumulate_request_errors_kernel',
     _broadcast_request_errors_kernel: '_broadcast_request_errors_kernel',
@@ -1221,6 +1342,7 @@ _SUPPORT_KERNEL_KEYS = {
     _validate_packed_boundaries_kernel: '_validate_packed_boundaries_kernel',
     _validate_packed_requests_kernel: '_validate_packed_requests_kernel',
     _validate_page_tables_kernel: '_validate_page_tables_kernel',
+    _expand_global_selected_groups_kernel: "_expand_global_selected_groups_kernel",
 }
 
 _support_launch_context: contextvars.ContextVar[
@@ -1625,6 +1747,9 @@ def launch_compress_completed_groups(
         COMPRESS_RATIO=int(caps.compress_ratio),
         RING_CAPACITY=int(caps.raw_ring_capacity),
         COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
+        DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+        DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+        CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
         POSITION_AXES=int(caps.position_axes),
         MROPE_INTERLEAVED=bool(caps.mrope_interleaved),
         MROPE_SECTION_0=section0,
@@ -1729,6 +1854,9 @@ def launch_score_representatives(
         INDEX_HEAD_DIM=int(caps.index_head_dim),
         COMPRESS_RATIO=int(caps.compress_ratio),
         COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
+        DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+        DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+        CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
         BLOCK_G=block_g,
         BLOCK_D=triton.next_power_of_2(int(caps.index_head_dim)),
         num_warps=4,
@@ -1874,8 +2002,35 @@ def launch_expand_selected_groups(
         GROUP_BUDGET=int(caps.group_budget),
         COMPRESS_RATIO=int(caps.compress_ratio),
         SELECTION_WIDTH=int(caps.selection_width),
+        DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+        DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+        CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
         BLOCK_W=triton.next_power_of_2(int(caps.selection_width)),
         num_warps=8,
+    )
+
+
+def launch_expand_global_selected_groups(
+    *,
+    topk_group_ids: torch.Tensor,
+    query_positions: torch.Tensor,
+    selected_positions: torch.Tensor,
+    caps,
+) -> None:
+    rows = int(query_positions.shape[0])
+    _launch_triton(_expand_global_selected_groups_kernel, (rows,), topk_group_ids,
+    query_positions,
+    selected_positions,
+    int(topk_group_ids.stride(0)),
+    int(selected_positions.stride(0)),
+    GROUP_BUDGET=int(caps.group_budget),
+    COMPRESS_RATIO=int(caps.compress_ratio),
+    SELECTION_WIDTH=int(caps.selection_width),
+    DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+    DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+    CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
+    BLOCK_W=triton.next_power_of_2(int(caps.selection_width)),
+    num_warps=8,
     )
 
 
@@ -1896,7 +2051,7 @@ def launch_poison_failed_rows(
     )
 
 
-_SUPPORT_WRAPPER_NAMES = ('launch_validate_rows', 'launch_validate_page_tables', 'launch_validate_shared_pool_ownership', 'launch_prepare_index_query', 'launch_validate_completed_groups', 'launch_propagate_request_errors', 'launch_compress_completed_groups', 'launch_commit_raw_ring', 'launch_score_representatives', 'launch_stage_topk_carry', 'launch_topk_groups', 'launch_remap_topk_group_ids', 'launch_stabilize_topk', 'launch_expand_selected_groups', 'launch_poison_failed_rows')
+_SUPPORT_WRAPPER_NAMES = ('launch_validate_rows', 'launch_validate_page_tables', 'launch_validate_shared_pool_ownership', 'launch_prepare_index_query', 'launch_validate_completed_groups', 'launch_propagate_request_errors', 'launch_compress_completed_groups', 'launch_commit_raw_ring', 'launch_score_representatives', 'launch_stage_topk_carry', 'launch_topk_groups', 'launch_remap_topk_group_ids', 'launch_stabilize_topk', 'launch_expand_selected_groups', 'launch_expand_global_selected_groups', 'launch_poison_failed_rows')
 
 for _name in _SUPPORT_WRAPPER_NAMES:
     globals()[_name] = _prepared_support_wrapper(globals()[_name])
@@ -1918,4 +2073,5 @@ __all__ = [
     "launch_stabilize_topk",
     "launch_expand_selected_groups",
     "launch_poison_failed_rows",
+    "launch_expand_global_selected_groups",
 ]

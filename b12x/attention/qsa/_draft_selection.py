@@ -139,6 +139,9 @@ def _prepare_kernel(
     max_requests,
     WIDTH: tl.constexpr,
     TAIL: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -166,9 +169,28 @@ def _prepare_kernel(
         other=-1,
     )
     tail = start + column - WIDTH
-    value = tl.where(
-        column < WIDTH, original, tl.where(valid & (tail <= position), tail, -1)
-    )
+    if DCP_SIZE == 1:
+        value = tl.where(
+            column < WIDTH,
+            original,
+            tl.where(valid & (tail <= position), tail, -1),
+        )
+    else:
+        stripe = tail // CP_INTERLEAVE
+        owner = stripe % DCP_SIZE
+        local_tail = (
+            (stripe // DCP_SIZE) * CP_INTERLEAVE
+            + tail % CP_INTERLEAVE
+        )
+        value = tl.where(
+            column < WIDTH,
+            original,
+            tl.where(
+                valid & (tail <= position) & (owner == DCP_RANK),
+                local_tail,
+                -1,
+            ),
+        )
     tl.store(
         selected + row * tl.full((), WIDTH + TAIL, tl.int64) + column,
         value,
@@ -191,6 +213,9 @@ def prepare_selection(
     errors_offset: int,
     max_requests: int,
     tail: int,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> None:
     from ._contract import DraftSelectionPlan, _scratch_view
 
@@ -242,5 +267,8 @@ def _prepare_fake(
     errors_offset,
     max_requests,
     tail,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> None:
     return None

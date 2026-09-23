@@ -19,6 +19,7 @@ class WeightEncoding(str, Enum):
     FP4_E2M1 = "fp4_e2m1"
     FP6_E2M3 = "fp6_e2m3"
     TRELLIS = "trellis"
+    IQ2_XS = "iq2_xs"
 
 
 class ScaleEncoding(str, Enum):
@@ -29,6 +30,7 @@ class ScaleEncoding(str, Enum):
     E8M0_K32 = "e8m0_k32"
     E8M0_K32_E4M3_RESIDUAL = "e8m0_k32_x_e4m3_k16_residual"
     TRELLIS_SCALES = "trellis_scales"
+    IQ2_XS = "iq2_xs"
 
 
 class WeightPacking(str, Enum):
@@ -39,6 +41,7 @@ class WeightPacking(str, Enum):
     MMA_PACKED = "mma_packed"
     QMMA_REPACKED = "qmma_repacked"
     TRELLIS_NATIVE = "trellis_native"
+    IQ2_XS_COMPACT = "iq2_xs_compact"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -78,21 +81,21 @@ class ScaleFactors:
 class TrellisWeights:
     """Layer-local views of the canonical ``b12x_trellis`` tensors.
 
-    ``atoms`` is the rank-local ``[I_local/32, row_stride]`` uint8 payload.
+    ``codes`` is the rank-local ``[I_local/32, row_stride]`` uint8 payload.
     ``rate`` is a view selected from the single model-level uint8 rate tensor;
     it is never copied merely to give each layer its own rate parameter.
     """
 
-    atoms: torch.Tensor
+    codes: torch.Tensor
     rate: torch.Tensor
     input_scales: ScaleFactors
     intermediate_scales: ScaleFactors
     output_scales: ScaleFactors
-    expert_transform_draws: torch.Tensor | None = None
+    expert_sign_patterns: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.atoms, torch.Tensor):
-            raise TypeError("TrellisWeights.atoms must be a torch.Tensor")
+        if not isinstance(self.codes, torch.Tensor):
+            raise TypeError("TrellisWeights.codes must be a torch.Tensor")
         if not isinstance(self.rate, torch.Tensor):
             raise TypeError("TrellisWeights.rate must be a torch.Tensor")
         for name in (
@@ -102,12 +105,28 @@ class TrellisWeights:
         ):
             if not isinstance(getattr(self, name), ScaleFactors):
                 raise TypeError(f"TrellisWeights.{name} must be ScaleFactors")
-        if self.expert_transform_draws is not None and not isinstance(
-            self.expert_transform_draws, torch.Tensor
+        if self.expert_sign_patterns is not None and not isinstance(
+            self.expert_sign_patterns, torch.Tensor
         ):
             raise TypeError(
-                "TrellisWeights.expert_transform_draws must be a tensor or None"
+                "TrellisWeights.expert_sign_patterns must be a tensor or None"
             )
+
+
+@dataclass(frozen=True)
+class IQ2XSWeights:
+    """Safetensors uint8[E,N,K/256,74] blocks in PackedSource.w13_layout order."""
+
+    w13: torch.Tensor
+    w2: torch.Tensor
+
+    def __post_init__(self) -> None:
+        for name in ("w13", "w2"):
+            tensor = getattr(self, name)
+            if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.uint8:
+                raise TypeError(f"IQ2XSWeights.{name} must be a uint8 tensor")
+            if tensor.ndim != 4 or tensor.shape[-1] != 74:
+                raise ValueError(f"IQ2XSWeights.{name} must have shape [E,N,K/256,74]")
 
 
 @dataclass(frozen=True)
@@ -186,6 +205,7 @@ class PreparedExperts:
 
 __all__ = [
     "PackedWeights",
+    "IQ2XSWeights",
     "PreparedExperts",
     "PreparedWeightFormat",
     "ScaleEncoding",
