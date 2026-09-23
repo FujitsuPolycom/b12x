@@ -164,6 +164,84 @@ def test_qsa_dcp_attend_reuse_rejects_unsharded_binding(
         )
 
 
+def test_qsa_dcp_draft_reuse_keeps_prepared_handle_and_error_storage(monkeypatch):
+    from b12x.attention.qsa import _draft_selection
+
+    binding = _boundary_binding(dcp_size=2)
+    object.__setattr__(binding.plan, "_handle", 73)
+    calls = []
+
+    def prepare(handle, storage, capacity, width, source_rows, request_ids,
+                query_positions, scratch, selected_offset, errors_offset,
+                max_requests, tail, dcp_size, dcp_rank, interleave):
+        assert handle == 73
+        assert storage is binding.draft_selection._storage
+        assert scratch is binding.scratch
+        assert errors_offset == 0
+        assert (capacity, max_requests, tail, dcp_size, dcp_rank, interleave) == (2, 2, 3, 2, 0, 4)
+        calls.append(True)
+
+    monkeypatch.setattr(_draft_selection, "validate_buffers", lambda *args: None)
+    monkeypatch.setattr(_draft_selection, "prepare_selection", prepare)
+    monkeypatch.setattr(contract, "_run_attention", lambda bound, **kw: bound.output[:1])
+    output, lse = contract.attend_reuse(
+        binding, query=torch.empty(1, 24, 256, dtype=torch.bfloat16),
+        request_ids=torch.zeros(1, dtype=torch.int32),
+        query_positions=torch.zeros(1, dtype=torch.int64),
+        reuse=contract.DraftSelectionReuse(torch.zeros(2, dtype=torch.int32)),
+    )
+    assert calls == [True]
+    assert output.shape == (1, 24, 256) and lse.shape == (1, 24)
+
+
+@pytest.mark.parametrize("size,rank,length,local_tokens", [(4, 0, 256, 64), (4, 3, 259, 64), (2, 0, 256, 128), (2, 1, 4, 0)])
+@pytest.mark.parametrize("shared", [False, True])
+def test_qsa_dcp_validators_only_read_live_local_pages(size, rank, length, local_tokens, shared):
+    """Minimal tables and poisoned unused entries expose global/local confusion."""
+    from b12x.attention.qsa import _kernels
+
+    device = require_sm120()
+    main_count = (local_tokens + 63) // 64
+    group_count = local_tokens // 4
+    compressed_count = (group_count + 15) // 16
+    main = torch.full((1, max(1, main_count)), -1, dtype=torch.int32, device=device)
+    compressed = torch.full((1, max(1, compressed_count)), -1, dtype=torch.int32, device=device)
+    main[:, :main_count] = 0
+    compressed[:, :compressed_count] = 0
+    request = torch.zeros(1, dtype=torch.int32, device=device)
+    lengths = torch.tensor([length], dtype=torch.int32, device=device)
+    raw_slots = torch.ones(1, dtype=torch.int32, device=device)
+    errors = torch.zeros(1, dtype=torch.int32, device=device)
+    caps = SimpleNamespace(max_batch=1, max_raw_state_slots=2, main_page_size=64,
+                           compressed_page_size=16, compress_ratio=4, max_seq_len=1024,
+                           dcp_size=size, dcp_rank=rank, cp_kv_cache_interleave_size=4)
+    _kernels.launch_validate_page_tables(
+        request_ids=request, sequence_lengths=lengths, main_block_table=main,
+        compressed_block_table=compressed, raw_state_slot_ids=raw_slots,
+        state_errors=errors, num_main_pages=1, num_compressed_pages=2,
+        shared_compressed_raw_pool=shared, caps=caps,
+    )
+    assert errors.item() == 0
+    if shared:
+        occupancy = torch.empty(3, dtype=torch.int32, device=device)
+        _kernels.launch_validate_shared_pool_ownership(
+            request_ids=request, sequence_lengths=lengths,
+            compressed_block_table=compressed, raw_state_slot_ids=raw_slots,
+            state_errors=errors, occupancy=occupancy, num_compressed_pages=2, caps=caps,
+        )
+        assert errors.item() == 0
+        assert occupancy.tolist() == [int(compressed_count > 0), 0, 0]
+    if main_count:
+        main[0, 0] = 1
+        _kernels.launch_validate_page_tables(
+            request_ids=request, sequence_lengths=lengths, main_block_table=main,
+            compressed_block_table=compressed, raw_state_slot_ids=raw_slots,
+            state_errors=errors, num_main_pages=1, num_compressed_pages=2,
+            shared_compressed_raw_pool=shared, caps=caps,
+        )
+        assert errors.item() & 2048
+
+
 @pytest.mark.parametrize("global_tokens", [4, 64])
 def test_qsa_dcp4_shards_and_lse_merge_match_global_attention(
     global_tokens: int,

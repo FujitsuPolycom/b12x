@@ -240,6 +240,19 @@ def _materialize_packed_row_errors_kernel(
 
 
 @triton.jit
+def _local_dcp_count(count, SIZE: tl.constexpr, RANK: tl.constexpr, INTERLEAVE: tl.constexpr):
+    if SIZE == 1:
+        return count
+    else:
+        width = tl.full((), SIZE * INTERLEAVE, tl.int64)
+        rounds = count // width
+        remainder = count - rounds * width
+        return rounds * INTERLEAVE + tl.minimum(
+            tl.maximum(remainder - RANK * INTERLEAVE, 0), INTERLEAVE
+        )
+
+
+@triton.jit
 def _validate_page_tables_kernel(
     request_ids,
     sequence_lengths,
@@ -260,6 +273,9 @@ def _validate_page_tables_kernel(
     MAX_BATCH: tl.constexpr,
     MAX_RAW_STATE_SLOTS: tl.constexpr,
     SHARED_COMPRESSED_RAW_POOL: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     BLOCK_BATCH: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
@@ -274,8 +290,11 @@ def _validate_page_tables_kernel(
     ).to(tl.int64)
     pages = page_block * BLOCK_P + tl.arange(0, BLOCK_P)
 
-    main_pages = tl.cdiv(sequence_length, MAIN_PAGE_SIZE)
-    main_active = real_request & (pages < main_pages)
+    local_tokens = _local_dcp_count(sequence_length, DCP_SIZE, DCP_RANK, CP_INTERLEAVE)
+    main_pages = tl.cdiv(local_tokens, MAIN_PAGE_SIZE)
+    if (page_block == 0) & real_request & (main_pages > MAIN_TABLE_WIDTH):
+        tl.atomic_or(state_errors + row, 2048)
+    main_active = real_request & (pages < main_pages) & (pages < MAIN_TABLE_WIDTH)
     main_offsets = (request * main_table_stride + pages.to(tl.int64)).to(tl.int64)
     main_physical = tl.load(
         main_block_table + main_offsets,
@@ -290,8 +309,13 @@ def _validate_page_tables_kernel(
         tl.atomic_or(state_errors + row, 2048)
 
     completed_groups = sequence_length // COMPRESS_RATIO
+    completed_groups = _local_dcp_count(
+        completed_groups, DCP_SIZE, DCP_RANK, CP_INTERLEAVE // COMPRESS_RATIO
+    )
     compressed_pages = tl.cdiv(completed_groups, COMPRESSED_PAGE_SIZE)
-    compressed_active = real_request & (pages < compressed_pages)
+    if (page_block == 0) & real_request & (compressed_pages > COMPRESSED_TABLE_WIDTH):
+        tl.atomic_or(state_errors + row, 1024)
+    compressed_active = real_request & (pages < compressed_pages) & (pages < COMPRESSED_TABLE_WIDTH)
     compressed_offsets = (request * compressed_table_stride + pages.to(tl.int64)).to(
         tl.int64
     )
@@ -350,6 +374,9 @@ def _mark_live_compressed_pages_kernel(
     COMPRESSED_TABLE_WIDTH: tl.constexpr,
     COMPRESSED_PAGE_SIZE: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
     owner = tl.program_id(0)
@@ -361,7 +388,12 @@ def _mark_live_compressed_pages_kernel(
 
     pages = page_block * BLOCK_P + tl.arange(0, BLOCK_P)
     completed_groups = tl.where(valid_length, sequence_length // COMPRESS_RATIO, 0)
+    completed_groups = _local_dcp_count(
+        completed_groups, DCP_SIZE, DCP_RANK, CP_INTERLEAVE // COMPRESS_RATIO
+    )
     live_pages = tl.cdiv(completed_groups, COMPRESSED_PAGE_SIZE)
+    if (page_block == 0) & valid_length & (live_pages > COMPRESSED_TABLE_WIDTH):
+        tl.atomic_or(occupancy + table_error_offset, 1)
     active = valid_length & (pages < live_pages) & (pages < COMPRESSED_TABLE_WIDTH)
     offsets = owner.to(tl.int64) * compressed_table_stride + pages.to(tl.int64)
     physical = tl.load(
@@ -1529,6 +1561,9 @@ def launch_validate_page_tables(
         MAX_BATCH=int(caps.max_batch),
         MAX_RAW_STATE_SLOTS=int(caps.max_raw_state_slots),
         SHARED_COMPRESSED_RAW_POOL=bool(shared_compressed_raw_pool),
+        DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+        DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+        CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
         BLOCK_BATCH=triton.next_power_of_2(int(caps.max_batch)),
         BLOCK_P=block_p,
         num_warps=1,
@@ -1569,6 +1604,9 @@ def launch_validate_shared_pool_ownership(
         COMPRESSED_TABLE_WIDTH=int(compressed_block_table.shape[1]),
         COMPRESSED_PAGE_SIZE=int(caps.compressed_page_size),
         COMPRESS_RATIO=int(caps.compress_ratio),
+        DCP_SIZE=int(getattr(caps, "dcp_size", 1)),
+        DCP_RANK=int(getattr(caps, "dcp_rank", 0)),
+        CP_INTERLEAVE=int(getattr(caps, "cp_kv_cache_interleave_size", 1)),
         BLOCK_P=block_p,
         num_warps=1,
     )

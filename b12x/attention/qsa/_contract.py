@@ -4044,6 +4044,7 @@ def attend_reuse(
         [query, request_ids, query_positions, reuse.source_rows],
     )
     prepare_selection(
+        binding.plan.handle,
         state._storage,
         state.plan.max_source_rows,
         state.plan.selection_width,
@@ -4052,6 +4053,7 @@ def attend_reuse(
         query_positions,
         binding.scratch,
         binding.state._layout.draft_positions_offset_bytes,
+        0,
         caps.max_batch,
         caps.max_speculative_tokens,
         caps.dcp_size,
