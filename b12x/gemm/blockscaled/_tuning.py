@@ -109,14 +109,30 @@ def functional_mxfp8_quantization(query, config):
             and query.output_mode == "functional" and query.workspace_form == "owned")
 
 
+def fused_mxfp8_quantization_eligible(query, device):
+    """Bound inline activation quantization by its prepared storage geometry."""
+    return (
+        query.recipe == "mxfp8" and query.activation_mode in ("auto", "quantized")
+        and 0 < query.num_tokens <= 8
+        and (query.expected_m is None or query.expected_m == query.num_tokens)
+        and query.in_features == query.padded_in_features
+        and query.padded_in_features % 128 == 0
+        and 0 < query.out_features <= 4096 and query.out_features % 64 == 0
+        and query.source_contiguous and query.source_aligned
+        and not query.activation_scale_available
+        and device is not None and device.compute_capability in ((12, 0), (12, 1))
+    )
+
+
 def effective_a16_config(query, config):
     return config.tile_n, config.tile_k, min(config.split_k, (query.in_features + config.tile_k - 1) // config.tile_k)
 
 
 def _validate_config(query, config, device):
-    if not isinstance(config, BlockscaledConfig) or config.mode not in ("a16", "quantized"):
+    if not isinstance(config, BlockscaledConfig) or config.mode not in ("a16", "quantized", "fused_quantized"):
         raise ValueError("invalid packed precision configuration")
-    if query.activation_mode != "auto" and config.mode != query.activation_mode:
+    precision = "quantized" if config.mode == "fused_quantized" else config.mode
+    if query.activation_mode != "auto" and precision != query.activation_mode:
         raise ValueError("configuration conflicts with caller activation precision")
     if query.recipe == "iq2_xs" and config.mode != "a16":
         raise ValueError("IQ2_XS supports only A16 execution")
@@ -150,10 +166,16 @@ def _validate_config(query, config, device):
             raise ValueError("quantized execution has no A16 launch knobs")
         if query.padded_in_features % 128:
             raise ValueError("quantized execution requires stored K128")
+        if config.mode == "fused_quantized" and not fused_mxfp8_quantization_eligible(query, device):
+            raise ValueError("inline MXFP8 quantization requires an eligible small prepared regime")
         if query.workspace_nbytes is not None and not functional_mxfp8_quantization(query, config):
-            from ._a16 import _layout
-            needed = _layout(query.num_tokens, query.out_features, query.padded_in_features,
-                             query.recipe == "nvfp4", (64, 64, 1))[-1]
+            from ._preparation import _workspace_bytes
+            if config.mode == "fused_quantized":
+                from types import SimpleNamespace
+                from ._preparation import _fused_quant_lowering
+                needed = _fused_quant_lowering(query, SimpleNamespace(identity=device)).workspace_nbytes
+            else:
+                needed = _workspace_bytes(query, config)
             if query.workspace_nbytes < needed:
                 raise ValueError("caller workspace is too small for quantized execution")
         if not functional_mxfp8_quantization(query, config):
@@ -168,8 +190,15 @@ def _validate_config(query, config, device):
 
 
 def _tuning_parameters(query, device):
-    del device
+    modes = ("a16",) if query.recipe == "iq2_xs" else (
+        ("a16", "quantized") if query.activation_mode == "auto" else (query.activation_mode,)
+    )
+    if fused_mxfp8_quantization_eligible(query, device):
+        modes += ("fused_quantized",)
+
     def eligible(parameters):
+        if parameters["mode"] == "fused_quantized":
+            return fused_mxfp8_quantization_eligible(query, device)
         if parameters["mode"] != "a16":
             return True
         if parameters["tile_n"] == 4:
@@ -187,28 +216,28 @@ def _tuning_parameters(query, device):
 
     return ParameterSpace.create(
         TUNING.knobs,
-        values={"mode": ("a16",) if query.recipe == "iq2_xs" else ("a16", "quantized") if query.activation_mode == "auto" else (query.activation_mode,)},
+        values={"mode": modes},
         predicates=(eligible,),
     )
 
 
 def _equivalence(query, device, config):
-    if config.mode == "quantized":
-        return {"mode": "quantized"}
+    if config.mode in ("quantized", "fused_quantized"):
+        return {"mode": config.mode}
     n, k, split = effective_a16_config(query, config)
     return {"mode": "a16", "tile_m": config.tile_m or 16, "tile_n": n, "tile_k": k, "split_k": split}
 
 
 TUNING = TuningContract(
-    component_id="gemm.blockscaled_precision", query_schema_version=5, config_schema_version=4,
+    component_id="gemm.blockscaled_precision", query_schema_version=5, config_schema_version=5,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {name: getattr(query, name) for name in query.__dataclass_fields__},
     encode_config=BlockscaledConfig.to_dict, decode_config=BlockscaledConfig.from_config,
     validate_query=_validate_query, validate_config=_validate_config, default_config=_default_config,
-    candidate_contract_version=17,
+    candidate_contract_version=18,
     knobs=(
-        Knob(name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE),
+        Knob(name="mode", values=("a16", "quantized", "fused_quantized"), binding=ParameterBinding.COMPILE),
         Knob(name="tile_m", values=(1, 2, 4, 8, 16, 32, 64), when=FrozenMapping({"mode": "a16"})),
         Knob(name="tile_n", values=(4, 64, 128), when=FrozenMapping({"mode": "a16"})),
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),

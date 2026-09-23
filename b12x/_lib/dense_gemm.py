@@ -143,6 +143,9 @@ _B12X_TIMING_THRESHOLD_MS = float(
     )
 )
 _B12X_DENSE_SPLITK_TURBO = os.getenv("B12X_DENSE_SPLITK_TURBO", "1") == "1"
+_B12X_DENSE_NARROW_SPLITK_MAX = int(os.getenv("B12X_DENSE_NARROW_SPLITK_MAX", "8"))
+if _B12X_DENSE_NARROW_SPLITK_MAX < 0:
+    raise ValueError("B12X_DENSE_NARROW_SPLITK_MAX must be nonnegative")
 
 # MX-FP6 decode uses at most three mainloop stages when two CTAs share an SM.
 _FP6_DECODE_TILE = (16, 64)
@@ -191,14 +194,35 @@ def _reduce_split_k2_bf16_kernel(
 
 
 def _reduce_split_k2_bf16(
-    partials: torch.Tensor, out: torch.Tensor, *, m: int, n: int
+    partials: torch.Tensor, out: torch.Tensor, *, m: int, n: int,
+    stream_int: int | None = None,
 ) -> None:
-    """Fused 2-way split-K FP32-partials reduction (exact); faster than torch.add.
+    """Ordered FP32 partial reduction with one BF16 rounding.
 
-    Falls back to torch.add when the scratch/output layout is not the expected
-    [m, n, 2] / [m, n, 1] contiguous-row form.
+    The existing two-slice path retains torch.add for strided scratch. Four
+    and eight slices require the prepared slice-major layout and reuse the
+    ordered CuTe reducer; they have no numerical fallback.
     """
     total = int(m) * int(n)
+    slices = int(partials.shape[2])
+    if slices != 2:
+        if (
+            slices not in (4, 8)
+            or partials.shape != (m, n, slices)
+            or partials.stride() != (n, 1, total)
+            or partials.dtype != torch.float32
+            or not partials.is_cuda
+            or out.shape != (m, n, 1)
+            or out.stride()[0:2] != (n, 1)
+            or out.dtype != torch.bfloat16
+            or out.device != partials.device
+            or partials.data_ptr() % 16
+            or out.data_ptr() % 16
+        ):
+            raise ValueError("ordered dense split-K requires aligned slice-major FP32 partials and BF16 output")
+        program = _compile_dense_split_reduction(m, n, slices, out.device.index)
+        _run_dense_split_reduction(program, partials, out, m, n, slices, stream_int)
+        return
     if (
         partials.shape == (m, n, 2)
         and partials.stride() == (n, 1, total)
@@ -211,6 +235,33 @@ def _reduce_split_k2_bf16(
         _reduce_split_k2_bf16_kernel[grid](partials, out, total, BLOCK=block)
     else:
         torch.add(partials[:, :, 0], partials[:, :, 1], out=out[:, :, 0])
+
+
+def _compile_dense_split_reduction(m, n, slices, device_ordinal):
+    """Retain an exact reducer during preparation; M remains a runtime scalar."""
+    if slices == 2:
+        return _reduce_split_k2_bf16_kernel.warmup(
+            torch.float32, torch.bfloat16, m * n, BLOCK=1024,
+            grid=(triton.cdiv(m * n, 1024),),
+        )
+    if slices not in (4, 8):
+        raise ValueError("ordered dense split-K supports 2, 4 or 8 slices")
+    from b12x.gemm.blockscaled._reduce import compile_reduce
+
+    return compile_reduce(n, slices, device_ordinal)
+
+
+def _run_dense_split_reduction(program, partials, out, m, n, slices, stream_int):
+    """Launch the owned native program without compilation or scratch allocation."""
+    if slices == 2:
+        program[(triton.cdiv(m * n, 1024), 1, 1)](partials, out, m * n, 1024)
+        return
+    program(
+        make_ptr(cutlass.Float32, partials.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(cutlass.BFloat16, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        m,
+        current_cuda_stream() if stream_int is None else cuda.CUstream(stream_int),
+    )
 
 
 # @dsl_user_op on PersistentTileSchedulerParams.__init__ can rename attributes
@@ -403,6 +454,27 @@ def _use_direct_m1_wo_a_inputs(
     )
 
 
+def _dense_narrow_split_k_limit(m, n, k, l, mma_tiler_mn, cluster_shape_mn, sm_count, tile_k=128):
+    """Largest evenly divided tiny-row narrow-N split that fits one SM wave."""
+    tile_m, tile_n = mma_tiler_mn
+    if (
+        _B12X_DENSE_NARROW_SPLITK_MAX <= 1
+        or not 0 < m <= min(8, tile_m)
+        or not 0 < n < 4096
+        or k < 4096 or k % 256 or k % tile_k
+        or l != 1
+    ):
+        return 1
+    resident = _max_active_clusters_for(cluster_shape_mn, sm_count)
+    work_tiles = ((n + tile_n - 1) // tile_n) * ((m + tile_m - 1) // tile_m)
+    for slices in (8, 4, 2):
+        if (slices <= _B12X_DENSE_NARROW_SPLITK_MAX
+                and (k // tile_k) % slices == 0
+                and work_tiles * slices <= resident):
+            return slices
+    return 1
+
+
 def _dense_gemm_policy_for(
     *,
     m: int,
@@ -503,6 +575,15 @@ def _dense_gemm_policy_for(
     if not _B12X_DENSE_SPLITK_TURBO:
         # The FP32 workspace reducer consumes exactly two partials.
         split_k_slices = min(split_k_slices, 2)
+    split_k_atomic_bf16 = _B12X_DENSE_SPLITK_TURBO
+    if (split_k_slices == 1 and ab_dtype == cutlass.Float8E4M3FN
+            and c_dtype == cutlass.BFloat16):
+        narrow_slices = _dense_narrow_split_k_limit(
+            m, n, k, l, mma_tiler_mn, cluster_shape_mn, sm_count, tile_k,
+        )
+        if narrow_slices > 1:
+            split_k_slices = narrow_slices
+            split_k_atomic_bf16 = False
     # A declared expected_m owns compile-time tuning for its regime. Without a
     # hint, keep the unroll choice stable throughout the persistent scheduler
     # regime so one warmed kernel covers every live M in that regime.
@@ -550,7 +631,7 @@ def _dense_gemm_policy_for(
         direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
         use_m1_non_tma=use_m1_non_tma,
         split_k_slices=split_k_slices,
-        split_k_atomic_bf16=_B12X_DENSE_SPLITK_TURBO,
+        split_k_atomic_bf16=split_k_atomic_bf16,
         large_m_unroll=(
             ab_dtype == cutlass.Float8E4M3FN and use_large_m_unroll and l == 1
         ),
@@ -7012,7 +7093,7 @@ def _dense_gemm_launch_functional_op(
         stream_int,
     )
     if split_k_output and not split_k_atomic_bf16:
-        _reduce_split_k2_bf16(c_tensor_gpu, out, m=m, n=n)
+        _reduce_split_k2_bf16(c_tensor_gpu, out, m=m, n=n, stream_int=stream_int)
     return out
 
 
@@ -7729,7 +7810,8 @@ def dense_gemm_fused_quant_a(
         cuda_stream_to_int(stream),
     )
     if split_storage is not None:
-        _reduce_split_k2_bf16(split_storage.permute(1, 2, 0), out, m=m, n=n)
+        _reduce_split_k2_bf16(split_storage.permute(1, 2, 0), out, m=m, n=n,
+                             stream_int=cuda_stream_to_int(stream))
     return out
 
 
@@ -8187,11 +8269,20 @@ def dense_gemm(
                 "_split_k_slices_override is restricted to MXFP8 or block-FP8 "
                 "autotuning"
             )
-        if _split_k_slices_override not in (1, 2, 4):
+        if _split_k_slices_override not in (1, 2, 4, 8):
             raise ValueError(
-                "FP8 _split_k_slices_override must be 1, 2, or 4, got "
+                "FP8 _split_k_slices_override must be 1, 2, 4, or 8, got "
                 f"{_split_k_slices_override}"
             )
+        narrow_exact = (
+            c_cutlass_dtype == cutlass.BFloat16
+            and 1 < _split_k_slices_override <= _dense_narrow_split_k_limit(
+                m if expected_m is None else expected_m, n, k, l,
+                mma_tiler_mn, cluster_shape_mn, sm_count, tile_k,
+            )
+        )
+        if _split_k_slices_override == 8 and not narrow_exact:
+            raise ValueError("eight-way split-K requires resident narrow-N exact reduction")
         if _split_k_slices_override > 1:
             if m > 8 or m > mma_tiler_mn[0] or l != 1 or swap_ab:
                 raise ValueError(
@@ -8208,6 +8299,7 @@ def dense_gemm(
             if (
                 _split_k_slices_override > 2
                 and not _B12X_DENSE_SPLITK_TURBO
+                and not narrow_exact
             ):
                 raise ValueError(
                     "four-way split-K requires atomic-BF16 or an explicit "
@@ -8220,6 +8312,7 @@ def dense_gemm(
             split_k_slices=_split_k_slices_override,
             split_k_atomic_bf16=(
                 _split_k_slices_override > 1 and _B12X_DENSE_SPLITK_TURBO
+                and not narrow_exact
             ),
             large_m_unroll=policy.large_m_unroll,
         )
@@ -8600,7 +8693,7 @@ def dense_gemm(
     if split_k_output and not split_k_atomic_bf16:
         assert split_scratch is not None
         assert out is not None
-        _reduce_split_k2_bf16(split_scratch, out, m=m, n=n)
+        _reduce_split_k2_bf16(split_scratch, out, m=m, n=n, stream_int=stream_int)
         result = out
     if _B12X_TIMING:
         t_launch = time.perf_counter()
@@ -9067,11 +9160,20 @@ def _lower_dense_gemm(
                 "_split_k_slices_override is restricted to MXFP8 or block-FP8 "
                 "autotuning"
             )
-        if _split_k_slices_override not in (1, 2, 4):
+        if _split_k_slices_override not in (1, 2, 4, 8):
             raise ValueError(
-                "FP8 _split_k_slices_override must be 1, 2, or 4, got "
+                "FP8 _split_k_slices_override must be 1, 2, 4, or 8, got "
                 f"{_split_k_slices_override}"
             )
+        narrow_exact = (
+            c_cutlass_dtype == cutlass.BFloat16
+            and 1 < _split_k_slices_override <= _dense_narrow_split_k_limit(
+                m if expected_m is None else expected_m, n, k, l,
+                mma_tiler_mn, cluster_shape_mn, sm_count, tile_k,
+            )
+        )
+        if _split_k_slices_override == 8 and not narrow_exact:
+            raise ValueError("eight-way split-K requires resident narrow-N exact reduction")
         if _split_k_slices_override > 1:
             if m > 8 or m > mma_tiler_mn[0] or l != 1 or swap_ab:
                 raise ValueError(
@@ -9085,7 +9187,8 @@ def _lower_dense_gemm(
                     f"to divide evenly across slices; got K={k}, BK={tile_k}, "
                     f"slices={_split_k_slices_override}"
                 )
-            if _split_k_slices_override > 2 and not _B12X_DENSE_SPLITK_TURBO:
+            if (_split_k_slices_override > 2 and not _B12X_DENSE_SPLITK_TURBO
+                    and not narrow_exact):
                 raise ValueError(
                     "four-way split-K requires the atomic-BF16 reduction path"
                 )
@@ -9096,6 +9199,7 @@ def _lower_dense_gemm(
             split_k_slices=_split_k_slices_override,
             split_k_atomic_bf16=(
                 _split_k_slices_override > 1 and _B12X_DENSE_SPLITK_TURBO
+                and not narrow_exact
             ),
             large_m_unroll=policy.large_m_unroll,
         )
@@ -9207,11 +9311,8 @@ def _compile_dense_lowering(payload, device_ordinal):
             )
         programs = {"gemm": gemm}
         if split and not atomic:
-            if p.policy.split_k_slices != 2:
-                raise ValueError("non-atomic dense reduction requires two slices")
-            programs["reduce"] = _reduce_split_k2_bf16_kernel.warmup(
-                torch.float32, torch.bfloat16, p.m * p.n, BLOCK=1024,
-                grid=(triton.cdiv(p.m * p.n, 1024),),
+            programs["reduce"] = _compile_dense_split_reduction(
+                p.m, p.n, p.policy.split_k_slices, device_ordinal,
             )
         return programs
 
@@ -9314,7 +9415,7 @@ class _DenseExecutionState:
             alpha_tensor_gpu=alpha_value, stream_int=stream_int,
         )
         if temporary is not None:
-            self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](temporary, out, m * p.n, 1024)
+            _run_dense_split_reduction(self.reduction, temporary, out, m, p.n, p.policy.split_k_slices, stream_int)
         return out
 
 
@@ -9484,11 +9585,8 @@ def _compile_dense_fused_quant_lowering(payload, device_ordinal):
             )
         programs = {"gemm": gemm}
         if partials:
-            if p.policy.split_k_slices != 2:
-                raise ValueError("fused non-atomic split reduction requires two slices")
-            programs["reduce"] = _reduce_split_k2_bf16_kernel.warmup(
-                torch.float32, torch.bfloat16, p.m * p.n, BLOCK=1024,
-                grid=(triton.cdiv(p.m * p.n, 1024),),
+            programs["reduce"] = _compile_dense_split_reduction(
+                p.m, p.n, p.policy.split_k_slices, device_ordinal,
             )
         return programs
 
@@ -9558,7 +9656,7 @@ class _DenseFusedQuantState:
             b_launch = rhs_values_tiled
         self.gemm(source, b_launch, sfb, out if temporary is None else temporary, self.alpha_one, stream_int)
         if temporary is not None:
-            self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](temporary, out, m * p.n, 1024)
+            _run_dense_split_reduction(self.reduction, temporary, out, m, p.n, p.policy.split_k_slices, stream_int)
         return out
 
 

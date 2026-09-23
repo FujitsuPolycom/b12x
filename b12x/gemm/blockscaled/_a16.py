@@ -201,9 +201,12 @@ def _layout(m, n, k, fp4, config=None):
     alpha_start = triton.cdiv(scale_start + scale_bytes, 256) * 256
     partial_start = alpha_start + 256
     split = _config(config)[2]
+    exact_split_bound = (
+        8 if m <= 8 and n < 4096 and k >= 4096 and k % 256 == 0 else 2
+    )
     partial_bytes = max(
         split * m * n * 4 if split > 1 else 0,
-        2 * min(m, 8) * n * 4 if not fp4 else 0,
+        exact_split_bound * min(m, 8) * n * 4 if not fp4 else 0,
     )
     return scale_start, alpha_start, partial_start, partial_start + partial_bytes
 

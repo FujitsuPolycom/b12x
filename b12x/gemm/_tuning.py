@@ -51,6 +51,7 @@ def _codegen_snapshot():
     from b12x._lib import dense_gemm as dense
     return FrozenMapping({
         "split_k_atomic": dense._B12X_DENSE_SPLITK_TURBO,
+        "narrow_split_k_max": dense._B12X_DENSE_NARROW_SPLITK_MAX,
         "fused_fp6_quant": dense._DENSE_FUSED_QUANT,
     })
 
@@ -368,7 +369,13 @@ def knob_values(query):
         swap_ab=(False, True)
         if query.recipe in ("nvfp4", "mxfp8", "tensor_fp8")
         else (False,),
-        split_k_slices=(1, 2, 4) if query.recipe in ("mxfp8", "block_fp8") else (None,),
+        split_k_slices=(1, 2, 4, 8)
+        if query.recipe in ("mxfp8", "block_fp8")
+        and query.max_rows <= 8 and query.batch == 1
+        and query.out_features < 4096 and query.in_features >= 4096
+        and query.output_dtype == "bfloat16"
+        and query.codegen["narrow_split_k_max"] >= 8
+        else (1, 2, 4) if query.recipe in ("mxfp8", "block_fp8") else (None,),
         large_m_unroll=(False, True) if fp8 and query.batch == 1 else (None,),
         target_occupancy=(1, 2, 3, 4)
         if fp4 and query.output_mode == "provided"
@@ -458,7 +465,19 @@ def validate_config(query, config, device):
             raise ValueError(
                 "dense GEMM split-K requires unswapped single-batch decode and divisible K"
             )
-        if config.split_k_slices == 4 and not dense._B12X_DENSE_SPLITK_TURBO:
+        narrow_exact = (
+            query.output_dtype == "bfloat16"
+            and config.split_k_slices <= dense._dense_narrow_split_k_limit(
+                query.max_rows if query.expected_m is None else query.expected_m,
+                query.out_features, query.in_features, query.batch,
+                (config.tile_m, config.tile_n), (1, 1),
+                query.sm_count if query.sm_count is not None else getattr(device, "sm_count", 0),
+                config.tile_k,
+            )
+        )
+        if config.split_k_slices == 8 and not narrow_exact:
+            raise ValueError("eight-way split-K requires resident narrow-N exact reduction")
+        if config.split_k_slices == 4 and not dense._B12X_DENSE_SPLITK_TURBO and not narrow_exact:
             raise ValueError(
                 "four-way split-K requires the production atomic reduction path"
             )
@@ -553,8 +572,8 @@ def _validate_query(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.mm",
-    query_schema_version=7,
-    config_schema_version=2,
+    query_schema_version=8,
+    config_schema_version=3,
     query_fields=frozenset(field.name for field in fields(DenseGemmQuery)),
     config_fields=frozenset(field.name for field in fields(DenseGemmConfig)),
     encode_query=lambda query: {field.name: getattr(query, field.name) for field in fields(query)},
@@ -563,7 +582,7 @@ TUNING = TuningContract(
     default_config=default_config,
     validate_query=_validate_query,
     validate_config=validate_config,
-    candidate_contract_version=4,
+    candidate_contract_version=5,
     knobs=(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
         Knob(name="tile_m", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),
@@ -571,7 +590,7 @@ TUNING = TuningContract(
         Knob(name="tile_k", values=(64, 128, 256, 512), binding=ParameterBinding.COMPILE),
         Knob(name="load_path", values=("tma", "cpasync"), binding=ParameterBinding.COMPILE),
         Knob(name="swap_ab", values=(False, True), binding=ParameterBinding.COMPILE),
-        Knob(name="split_k_slices", values=(None, 1, 2, 4), binding=ParameterBinding.COMPILE),
+        Knob(name="split_k_slices", values=(None, 1, 2, 4, 8), binding=ParameterBinding.COMPILE),
         Knob(name="large_m_unroll", values=(None, False, True), binding=ParameterBinding.COMPILE),
         Knob(name="target_occupancy", values=(None, 1, 2, 3, 4), binding=ParameterBinding.COMPILE),
     ),

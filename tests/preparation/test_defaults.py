@@ -111,6 +111,60 @@ def test_packed_forced_a16_fallback_and_quantized_pin_remain_distinct():
     assert TUNING.configure(auto, device=device, override=pinned).default == pinned
 
 
+@pytest.mark.parametrize("activation", ["auto", "quantized"])
+def test_mxfp8_inline_quantizer_is_a_distinct_prepared_choice(activation):
+    from b12x.preparation import DeviceIdentity
+    from b12x.gemm.blockscaled._tuning import BlockscaledQuery, TUNING
+
+    device = DeviceIdentity("nvidia", (12, 1), 48, "synthetic SM121")
+    query = BlockscaledQuery(recipe="mxfp8", num_tokens=8, in_features=2560,
+                            padded_in_features=2560, out_features=4096,
+                            activation_mode=activation, workspace_form="provided")
+    choices = TUNING.eligible_plan(query, device)
+    modes = {config.mode for _, config in choices.candidates}
+    assert {"quantized", "fused_quantized"} <= modes
+    assert ("a16" in modes) == (activation == "auto")
+    assert TUNING.configure(query, device=device).default.mode != "fused_quantized"
+
+
+@pytest.mark.parametrize("changes", [
+    {"num_tokens": 9}, {"out_features": 4160}, {"out_features": 24},
+    {"in_features": 2528}, {"source_contiguous": False}, {"source_aligned": False},
+    {"activation_scale_available": True}, {"activation_mode": "a16"},
+    {"recipe": "nvfp4"}, {"expected_m": 1},
+])
+def test_inline_quantizer_rejects_incompatible_geometry_and_precision(changes):
+    from b12x.preparation import DeviceIdentity
+    from b12x.gemm.blockscaled._tuning import (
+        BlockscaledQuery, BlockscaledConfig, TUNING, fused_mxfp8_quantization_eligible,
+    )
+
+    device = DeviceIdentity("nvidia", (12, 1), 48, "synthetic SM121")
+    query = BlockscaledQuery(recipe="mxfp8", num_tokens=8, in_features=2560,
+                            padded_in_features=2560, out_features=4096)
+    query = replace(query, **changes)
+    assert not fused_mxfp8_quantization_eligible(query, device)
+    with pytest.raises(ValueError):
+        TUNING.configure(query, device=device, override=BlockscaledConfig(mode="fused_quantized"))
+
+
+def test_inline_quantizer_avoids_activation_staging_for_short_k():
+    from b12x.preparation import DeviceIdentity
+    from b12x.gemm.blockscaled._tuning import BlockscaledQuery, BlockscaledConfig, TUNING
+    from b12x.gemm.blockscaled._preparation import _workspace_bytes, _owned_bytes
+
+    device = DeviceIdentity("nvidia", (12, 1), 48, "synthetic SM121")
+    query = BlockscaledQuery(recipe="mxfp8", num_tokens=8, in_features=2560,
+                            padded_in_features=2560, out_features=4096)
+    config = BlockscaledConfig(mode="fused_quantized")
+    needed = _workspace_bytes(query, config)
+    assert needed == 0
+    assert _owned_bytes(query, config) == needed
+    provided = replace(query, workspace_form="provided", workspace_nbytes=needed)
+    assert TUNING.configure(provided, device=device, override=config).default == config
+    assert _owned_bytes(provided, config) == 0
+
+
 def test_packed_search_equivalence_uses_logical_k_split_clamping():
     from b12x.preparation import DeviceIdentity
     from b12x.gemm.blockscaled._tuning import BlockscaledQuery, TUNING, effective_a16_config

@@ -61,6 +61,30 @@ def _short_dense_lowering(query, config, device):
     return _lower_dense_with_hint(query, config, device, None)
 
 
+def _fused_quant_lowering(query, device):
+    from b12x._lib.dense_gemm import _lower_dense_gemm_fused_quant_a
+    from b12x.gemm._preparation import _metadata_operands
+    from b12x.gemm._tuning import DenseGemmQuery
+
+    dense_query = DenseGemmQuery(
+        recipe="mxfp8", entry_point="gemm.blockscaled.mm", weight_storage="native",
+        output_dtype="bfloat16", batch=1, max_rows=query.num_tokens,
+        in_features=query.padded_in_features, out_features=query.out_features,
+        output_mode="provided", alpha_mode="unit", expected_m=query.expected_m,
+    )
+    _, rhs, _, _, _ = _metadata_operands(dense_query)
+    source = torch.empty((query.num_tokens, query.in_features), dtype=torch.bfloat16, device="meta")
+    output = torch.empty_strided(
+        (query.num_tokens, query.out_features, 1),
+        (query.out_features, 1, query.num_tokens * query.out_features),
+        dtype=torch.bfloat16, device="meta",
+    )
+    return _lower_dense_gemm_fused_quant_a(
+        source, rhs[0], rhs[1], sm_count=device.identity.sm_count,
+        out=output, expected_m=query.expected_m,
+    )
+
+
 def compile_packed(query_payload, config_payload, dense_payload, short_dense_payload,
                    ordinal, sm_count, capability):
     import cutlass
@@ -71,6 +95,8 @@ def compile_packed(query_payload, config_payload, dense_payload, short_dense_pay
     config = BlockscaledConfig.from_config(FrozenMapping(config_payload))
     fp4 = query.recipe == "nvfp4"
     with torch.cuda.device(ordinal):
+        if config.mode == "fused_quantized":
+            return dense._compile_dense_fused_quant_lowering(dense_payload, ordinal)
         if config.mode == "a16":
             if config.tile_n == 4:
                 from ._iq2_xs_gemv import compile_gemv
@@ -139,6 +165,13 @@ def _owned_bytes(query, config):
 
 
 def _workspace_bytes(query, config):
+    if config.mode == "fused_quantized":
+        # A device-independent upper bound for metadata consumers. Materializing
+        # a fused plan uses the exact lowering's partial-storage requirement.
+        if query.in_features < 4096 or query.in_features % 256:
+            return 0
+        slices = 8 if query.out_features < 4096 else 2
+        return slices * query.num_tokens * query.out_features * 4
     if config.mode == "a16":
         slices = effective_a16_config(query, config)[2]
         return slices * query.num_tokens * query.out_features * 4 if slices > 1 else 0
@@ -261,6 +294,13 @@ class _PackedExecutionState:
                     raise ValueError("workspace is smaller than the prepared requirement")
                 if any(_overlap(workspace, tensor) for tensor in (*reads, out)):
                     raise ValueError("workspace must not overlap packed operands/output")
+            if config.mode == "fused_quantized":
+                core.run(
+                    source.view(m, q.in_features), values.view(q.out_features, stored_k, 1), scales,
+                    out=out.view(m, q.out_features, 1),
+                    split_k_workspace=None if workspace is None else workspace.view(torch.float32), stream=stream,
+                )
+                return out
             if config.mode == "a16":
                 import cutlass
                 import cutlass.cute as cute
@@ -316,10 +356,15 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
     def inner(config, device):
         key = (config, device.identity)
         if key not in lowerings:
-            lowerings[key] = (None, None) if config.mode == "a16" else (
-                _dense_lowering(query, config, device),
-                _short_dense_lowering(query, config, device),
-            )
+            if config.mode == "a16":
+                lowerings[key] = (None, None)
+            elif config.mode == "fused_quantized":
+                lowerings[key] = (_fused_quant_lowering(query, device), None)
+            else:
+                lowerings[key] = (
+                    _dense_lowering(query, config, device),
+                    _short_dense_lowering(query, config, device),
+                )
         return lowerings[key]
 
     def compile_jobs(config, device):
@@ -334,15 +379,15 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
     def memory(config, device):
         from b12x._lib import dense_gemm as dense
         from b12x.preparation import current_plan, current_prepared_state
-        needed = _workspace_bytes(query, config)
+        needed = inner(config, device)[0].workspace_nbytes if config.mode == "fused_quantized" else _workspace_bytes(query, config)
         scratch = (scratch_buffer_spec("blockscaled.scratch", nbytes=needed, device=torch.device("cuda", device.ordinal)),) if needed and query.workspace_form == "provided" else ()
         persistent = []
-        owned = _owned_bytes(query, config)
+        owned = (needed if query.workspace_form == "owned" else 0) if config.mode == "fused_quantized" else _owned_bytes(query, config)
         if owned:
             existing = current_prepared_state()
             resident = 0 if existing is None else min(owned, existing.owned_nbytes)
             persistent.append(PersistentMemory(("blockscaled.owned", current_plan()), owned, resident))
-        if query.recipe in ("mxfp8", "iq2_xs") and (config.mode == "a16" or functional_mxfp8_quantization(query, config)):
+        if query.recipe in ("mxfp8", "iq2_xs") and (config.mode in ("a16", "fused_quantized") or functional_mxfp8_quantization(query, config)):
             resident = dense._ALPHA_ONE_CACHE.get(("cuda", device.ordinal))
             persistent.append(PersistentMemory(("dense.alpha_one", device.ordinal), 4, 0 if resident is None else resident.numel() * resident.element_size()))
         if query.recipe == "iq2_xs":
@@ -362,13 +407,19 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
                                   device.ordinal, device.identity.sm_count,
                                   device.identity.compute_capability)
         resolved_device = torch.device("cuda", device.ordinal)
-        core = None if p is None else dense._DenseExecutionState(p, resolved_device, programs["gemm"], programs.get("reduce"), dense._cached_alpha_one(resolved_device) if p.alpha_is_one else None)
+        if config.mode == "fused_quantized":
+            core = dense._DenseFusedQuantState(
+                p, resolved_device, programs["gemm"], programs.get("reduce"),
+                dense._cached_alpha_one(resolved_device),
+            )
+        else:
+            core = None if p is None else dense._DenseExecutionState(p, resolved_device, programs["gemm"], programs.get("reduce"), dense._cached_alpha_one(resolved_device) if p.alpha_is_one else None)
         short_core = None if short is None else dense._DenseExecutionState(
             short, resolved_device, programs["short_gemm"], programs.get("short_reduce"),
             dense._cached_alpha_one(resolved_device) if short.alpha_is_one else None,
         )
-        offsets = None if config.mode == "a16" or functional_mxfp8_quantization(query, config) else _layout(query.num_tokens, query.out_features, query.padded_in_features, query.recipe == "nvfp4", (64, 64, 1))
-        needed = _workspace_bytes(query, config)
+        offsets = None if config.mode in ("a16", "fused_quantized") or functional_mxfp8_quantization(query, config) else _layout(query.num_tokens, query.out_features, query.padded_in_features, query.recipe == "nvfp4", (64, 64, 1))
+        needed = p.workspace_nbytes if config.mode == "fused_quantized" else _workspace_bytes(query, config)
         workspace = bases = None
         if query.workspace_form == "owned":
             from b12x.preparation import current_prepared_state

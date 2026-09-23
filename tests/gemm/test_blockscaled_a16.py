@@ -441,6 +441,77 @@ def test_mxfp8_prepared_functional_and_provided_forms_match():
         graph.reset()
 
 
+@pytest.mark.parametrize("n,k", [(4096, 2560), (3584, 2560), (2560, 1536), (640, 2560)])
+@pytest.mark.parametrize("provided", [False, True])
+def test_inline_mxfp8_quantization_reuses_prepared_state_and_matches_separate(n, k, provided):
+    """Small live rows reuse one frozen capacity and preserve output ownership."""
+    from b12x.preparation import require_prepared
+
+    require_b12x()
+    capacity = 8
+    weight, _, _ = make_weight("mxfp8", n, k)
+    source = torch.randn(capacity, k, device="cuda", dtype=torch.bfloat16) * 0.25
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16) * 0.01
+    outputs = [torch.empty(capacity, n, device="cuda", dtype=torch.bfloat16) if provided else None
+               for _ in range(2)]
+    values, scales, gain, _ = _a16._weight_parts(weight)
+    plans, workspaces, requests = [], [], []
+    for mode, output in zip(("quantized", "fused_quantized"), outputs):
+        config = BlockscaledConfig(mode=mode)
+        provisional = blockscaled.query_from_call(source, weight, activation_mode="quantized", out=output)
+        workspace = (torch.empty(_preparation._workspace_bytes(provisional, config),
+                                 device="cuda", dtype=torch.uint8) if provided else None)
+        query = blockscaled.query_from_call(source, weight, activation_mode="quantized",
+                                           out=output, workspace=workspace)
+        plan = blockscaled.plan(query, override=config)
+
+        def call(state, output=output, workspace=workspace):
+            return PreparedCall(run=lambda: state.run(source, values, scales, gain,
+                                                      out=output, workspace=workspace))
+
+        requests.append(plan.request(name=mode, prepare_call=call))
+        plans.append(plan)
+        workspaces.append(workspace)
+    with PreparationSession(device=source.device, autotune=False, compile_workers=2) as session:
+        session.prepare(tuple(requests))
+        fused_state = require_prepared(plans[1], "gemm.blockscaled_precision")
+        assert fused_state.config.mode == "fused_quantized"
+        assert "quantize" not in fused_state.programs
+        callable_before = fused_state.programs["gemm"]
+        session.freeze()
+        for rows in (1, 3, 8):
+            live = source[:rows]
+
+            def run(arm):
+                output = None if outputs[arm] is None else outputs[arm][:rows]
+                return blockscaled.mm(live, weight, plan=plans[arm], out=output,
+                                      workspace=workspaces[arm], bias=bias)
+
+            expected = run(0).clone()
+            actual = run(1)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert torch.isfinite(actual).all() and torch.count_nonzero(actual).item() > 0
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run(1)
+            output_ptr = captured.data_ptr()
+            for repetition in range(3):
+                if repetition == 0:
+                    live.copy_(torch.randn_like(live) * 0.125)
+                elif repetition == 1:
+                    live.fill_(448.0)
+                    live[:, ::2].neg_()
+                else:
+                    live.zero_()
+                expected = run(0).clone()
+                graph.replay()
+                torch.cuda.current_stream().synchronize()
+                torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+                assert captured.data_ptr() == output_ptr
+            assert fused_state.programs["gemm"] is callable_before
+            graph.reset()
+
+
 def test_mxfp8_prefill_capacity_owned_and_provided_match():
     """Both scratch contracts retain short and long programs under frozen capture."""
     require_b12x()

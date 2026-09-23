@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-sparkring-mxfp8-fused-quant-a",
+  "category": "performance",
+  "summary": "Offer prepared inline activation quantization for small MXFP8 projections",
+  "models": ["Qwen3.8-Flash-Next", "MXFP8 models"],
+  "compatibility": "Eligible SM120/SM121 plans can tune a fused_quantized alternative while retaining A16 and separate-quantization choices. Configuration and candidate identities change, requiring retuning.",
+  "details": [
+    "Only declared capacities up to eight BF16 rows, unpadded K and N divisible by 64 and no wider than 4096 admit the fused variant.",
+    "Fused plans compile before execution, own exact partial-storage requirements and avoid activation staging. Large prefill capacities retain their existing workspace envelopes.",
+    "Quantized narrow deep-K capacities up to eight rows reserve room for up to eight ordered FP32 partials; prepared numerical and replay qualification are recorded separately."
+  ],
+  "pull_requests": [288],
+  "requires": []
+}

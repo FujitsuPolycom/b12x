@@ -468,9 +468,16 @@ def _label(component: str, query: dict) -> str:
 def _contract_and_query(component: str, payload: dict):
     payload = dict(payload)
     if component == "gemm.blockscaled_precision":
+        from b12x._lib import dense_gemm as dense
         from b12x.gemm.blockscaled._tuning import TUNING, BlockscaledQuery
 
-        payload["codegen"] = _thawed(payload["codegen"])
+        recorded_codegen = dict(payload["codegen"])
+        assert set(recorded_codegen) == {"split_k_atomic", "fused_fp6_quant"}
+        # Replay the recorded choices under the added narrow split control;
+        # preserve the corpus's original precision/code-generation settings.
+        payload["codegen"] = _thawed({
+            **recorded_codegen, "narrow_split_k_max": dense._B12X_DENSE_NARROW_SPLITK_MAX,
+        })
         return TUNING, BlockscaledQuery(**payload)
     if component == "moe.decode":
         from b12x.moe.fused_moe._tuning import TUNING, MoeDecodeQuery
@@ -513,6 +520,18 @@ def test_corpus_declares_every_recorded_candidate_space():
     assert set(DECLARED) == set(CANDIDATES)
 
 
+def test_packed_corpus_adaptation_preserves_recorded_codegen_controls():
+    from b12x._lib import dense_gemm as dense
+
+    key = next(key for key in DECLARED if key[0] == "gemm.blockscaled_precision")
+    original = dict(DECLARED[key]["codegen"])
+    _, query = _contract_and_query(key[0], DECLARED[key])
+    assert {name: value for name, value in query.codegen.items()
+            if name != "narrow_split_k_max"} == original
+    assert query.codegen["narrow_split_k_max"] == dense._B12X_DENSE_NARROW_SPLITK_MAX
+    assert DECLARED[key]["codegen"] == original
+
+
 @pytest.mark.parametrize("key", sorted(CANDIDATES))
 def test_served_queries_keep_their_recorded_candidate_count(key):
     component, label = key
@@ -521,7 +540,14 @@ def test_served_queries_keep_their_recorded_candidate_count(key):
     iterator = contract.iterate(contract.configure(query, device=IDENTITY))
     for _ in iterator:
         pass
-    assert iterator.effective_count == after, f"{label}: {before} candidates before the rules"
+    added_inline_quantizer = component == "gemm.blockscaled_precision" and label in {
+        f"mxfp8 n{n} k{k}:{k} m{m} auto"
+        for n, k in ((2560, 3072), (640, 2560)) for m in (1, 2, 4, 8)
+    }
+    assert iterator.effective_count == after + int(added_inline_quantizer), (
+        f"{label}: {before} recorded candidates before the rules; "
+        f"inline MXFP8 quantization adds {int(added_inline_quantizer)}"
+    )
 
 
 @pytest.mark.parametrize("key", sorted(WINNERS))
