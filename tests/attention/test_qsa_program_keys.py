@@ -12,6 +12,7 @@ test process's CUDA state untouched.
 """
 from __future__ import annotations
 
+import ast
 import json
 import multiprocessing
 import os
@@ -27,6 +28,77 @@ PRODUCT_NAME = "NVIDIA GeForce RTX 5090"
 # Page counts on both sides of Triton's integer specialization boundaries: a
 # multiple of 16 and its neighbour; the smallest legal pool of each query joins them.
 PAGE_COUNTS = ((2, 2), (16, 16), (21536, 5384), (21537, 5385))
+
+
+@pytest.mark.parametrize("starts,rows,suffix,status,expected", [
+    ((0, 3), 2, 2, 1, False),
+    ((3, 4), 2, 0, 1, False),
+    ((-1, 1), 2, 0, 1, False),
+    ((1, 0), 2, 0, 1, False),
+    ((0, 0), 2, 0, 0, False),
+    ((0, 2), 2, 0, 1, False),
+    ((0, 2), 2, 0, 0, True),
+    ((0, 1), 1, 0, 0, True),
+    ((0, 0), 0, 0, 0, False),
+    ((0, 3), 2, 2, 0, False),
+    ((0, 16), 16, 7, 0, True),
+    ((0, 16), 16, 8, 0, False),
+])
+def test_raw_ring_commit_checks_boundaries_before_row_loads(
+    starts, rows, suffix, status, expected,
+):
+    """Execute the production load guards with bounds-checked host pointers.
+
+    This catches an invalid read even when CUDA's allocator would happen to
+    leave accessible memory beyond a tensor. GPU tests cover the full launch.
+    """
+    from types import SimpleNamespace
+
+    path = pathlib.Path(__file__).parents[2] / "b12x/attention/qsa/_kernels.py"
+    kernel = next(n for n in ast.parse(path.read_text()).body
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_commit_raw_ring_kernel")
+    prefix = []
+    for statement in kernel.body:
+        prefix.append(statement)
+        if isinstance(statement, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "real_request"
+            for target in statement.targets
+        ):
+            break
+
+    class HostScalarCasts(ast.NodeTransformer):
+        def visit_Call(self, node):
+            node = self.generic_visit(node)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "to":
+                return node.func.value
+            return node
+
+    class Pointer:
+        def __init__(self, values, offset=0):
+            self.values, self.offset = values, offset
+
+        def __add__(self, offset):
+            return Pointer(self.values, self.offset + offset)
+
+    def load(pointer, mask=True, other=None):
+        if not mask:
+            return other
+        assert 0 <= pointer.offset < len(pointer.values), "out-of-bounds row load"
+        if pointer.values is request_values:
+            assert status == 0, "errored request was dereferenced"
+        return pointer.values[pointer.offset]
+
+    request_values = [0] * rows
+    env = dict(
+        tl=SimpleNamespace(program_id=lambda axis: 0 if axis == 0 else suffix,
+                           load=load, minimum=min),
+        query_start_loc=Pointer(starts), state_errors=Pointer([status] * rows),
+        request_ids=Pointer(request_values), rows=rows, RING_CAPACITY=8,
+    )
+    code = HostScalarCasts().visit(ast.Module(body=prefix, type_ignores=[]))
+    exec(compile(ast.fix_missing_locations(code), str(path), "exec"), env)
+    assert bool(env["real_request"]) is expected
 
 
 def _smallest_legal_page_counts(payload: dict[str, object]) -> tuple[int, int]:
@@ -175,3 +247,52 @@ def test_qsa_multi_chunk_programs_are_retained(tmp_path) -> None:
         "_count_stable_topk_candidates_kernel", "_emit_stable_topk_kernel",
     })
     assert any(program[2] == "attention.qsa.stable_selection" for program in reference)
+
+
+def test_compile_qsa_enumerates_shared_storage_validators() -> None:
+    """Prepared support programs cover bindings whose caches share one pool.
+
+    The compile transaction never overlaps compressed and raw storage, so the
+    shared-pool page-table variant and the ownership validator must be compiled
+    explicitly and keyed apart from the separate-storage variant; otherwise a
+    shared-pool binding either misses its programs or runs the wrong variant.
+    """
+    from collections.abc import Mapping
+
+    qsa_root = pathlib.Path(__file__).parents[2] / "b12x/attention/qsa"
+    compiler = next(
+        n for n in ast.parse((qsa_root / "_contract.py").read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "compile_qsa"
+    )
+    block = next(
+        n for n in ast.walk(compiler)
+        if isinstance(n, ast.With)
+        and ast.unparse(n.items[0].context_expr) == "_support_context(support, compiling=True)"
+    )
+    calls = {
+        n.func.id: n for n in ast.walk(block)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    assert "launch_validate_shared_pool_ownership" in calls
+    keywords = {k.arg: k.value for k in calls["launch_validate_page_tables"].keywords}
+    shared = keywords["shared_compressed_raw_pool"]
+    assert isinstance(shared, ast.Constant) and shared.value is True
+
+    key_function = next(
+        n for n in ast.parse((qsa_root / "_kernels.py").read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "_support_kernel_key"
+    )
+    page_tables, score = object(), object()
+    env = {
+        "Mapping": Mapping,
+        "_SUPPORT_KERNEL_KEYS": {page_tables: "_validate_page_tables_kernel"},
+        "_score_representatives_kernel": score,
+    }
+    exec(
+        compile(ast.Module(body=[key_function], type_ignores=[]), "_support_kernel_key", "exec"),
+        env,
+    )
+    support_key = env["_support_kernel_key"]
+    assert support_key(page_tables, {"SHARED_COMPRESSED_RAW_POOL": False}) == "_validate_page_tables_kernel"
+    assert support_key(page_tables, {}) == "_validate_page_tables_kernel"
+    assert support_key(page_tables, {"SHARED_COMPRESSED_RAW_POOL": True}) == "_validate_page_tables_kernel/shared"

@@ -291,8 +291,10 @@ def _allocate_shared_compressed_raw_binding(
     caps: qsa.Caps,
     *,
     initialize_metadata: bool = True,
+    plan: qsa.Plan | None = None,
 ) -> qsa.Binding:
-    declaration = qsa.plan(caps, invocation=_invocation(caps, shared_pool=True))
+    declaration = (qsa.plan(caps, invocation=_invocation(caps, shared_pool=True))
+                   if plan is None else plan)
     layout = qsa_contract._scratch_layout(caps)[0]
     scratch = torch.empty((layout.total_nbytes,), dtype=torch.uint8, device=caps.device)
     device = caps.device
@@ -371,9 +373,12 @@ def _allocate_shared_compressed_raw_binding(
         dtype=torch.int32,
         device=device,
     )
-    slot_ids = torch.arange(
-        caps.max_batch, dtype=torch.int64, device=device
-    ).contiguous()
+    slot_descriptor = declaration.query.abi["operands"]["raw_state_slot_ids"]
+    slot_ids = torch.empty_strided(
+        (caps.max_batch,), tuple(slot_descriptor["strides"]),
+        dtype=getattr(torch, slot_descriptor["dtype"]), device=device,
+    )
+    slot_ids.copy_(torch.arange(caps.max_batch, device=device))
     q_weight = torch.zeros((caps.index_head_dim,), dtype=torch.float32, device=device)
     k_weight = torch.zeros_like(q_weight)
     rope_cos = torch.ones(
@@ -410,9 +415,12 @@ def _allocate_shared_compressed_raw_binding(
     def prepare_call(state: object) -> PreparedCall:
         prime_scratch = torch.empty_like(scratch)
         binding = state.bind_for_preparation(scratch=prime_scratch, **binding_kwargs)
-        restored = (
-            compressed, raw_ring, raw_tags, raw_rope, raw_interval_start, output, selected,
-        )
+        # The compressed cache and every raw-ring tensor are strided views of
+        # ``pool``; snapshot the pool bytes once. Cloning each view would
+        # materialize the raw ring's full logical shape, which on a
+        # unified-memory host can exhaust system memory before the CUDA
+        # allocator reports failure.
+        restored = (pool, output, selected)
         snapshots = tuple(tensor.clone() for tensor in restored)
         dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
 
@@ -485,7 +493,12 @@ def _dynamic_inputs(
         dtype=torch.float32,
         device="cpu",
     ).to(device=device, dtype=torch.bfloat16)
-    request_tensor = torch.tensor(request_ids, dtype=torch.int64, device=device)
+    # Prepared programs bind the request-ID dtype declared by the plan's ABI;
+    # runtime rows must match it exactly.
+    request_dtype = getattr(
+        torch, binding.state.abi["operands"]["request_ids"]["dtype"]
+    )
+    request_tensor = torch.tensor(request_ids, dtype=request_dtype, device=device)
     position_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
     rope_positions = (
         position_tensor[:, None].expand(rows, caps.position_axes).contiguous()
@@ -1130,6 +1143,62 @@ def test_qsa_shared_pool_runs_under_fullgraph_compile_and_checks_runtime_aliases
     assert int(binding.selected_positions[0, 0]) == 0
     with pytest.raises(ValueError, match="output.*query"):
         compiled(binding.output[:1], *arguments[1:])
+
+
+def test_qsa_malformed_boundaries_preserve_raw_state_and_recover_on_graph_replay():
+    """Run with compute-sanitizer to check masked loads, not just final state."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    device = require_sm120()
+    binding = _allocate_binding(_caps(device, max_batch=1, max_raw_state_slots=1))
+    binding.main_block_table[0, 0] = 0
+    binding.main_k_cache.zero_()
+    binding.main_v_cache.zero_()
+    binding.compressed_k_cache.zero_()
+    binding.raw_k_ring.zero_()
+    dynamic = _dynamic_inputs(
+        binding, positions=(0, 1), request_ids=(0, 0), is_prefilling=(True,),
+    )
+    state = (
+        binding.raw_k_ring, binding.raw_logical_positions,
+        binding.raw_rope_positions, binding.raw_interval_start_positions,
+        binding.compressed_k_cache,
+    )
+    initial = tuple(t.clone() for t in state)
+    addresses = tuple(t.data_ptr() for t in (*state, binding.scratch, binding.output))
+    qsa.run(binding, **dynamic)
+    graph = _cuda_graph()
+    for tensor, saved in zip(state, initial, strict=True):
+        tensor.copy_(saved)
+    with kernel_resolution_guard("QSA raw commit must reuse its prepared program"):
+        with torch.cuda.graph(graph):
+            result = qsa.run(binding, **dynamic)
+        for boundaries in ((0, 3), (3, 4), (-1, 1), (1, 0), (0, 2)):
+            for tensor, saved in zip(state, initial, strict=True):
+                tensor.copy_(saved)
+            dynamic["query_start_loc"].copy_(torch.tensor(
+                boundaries, dtype=torch.int32, device=device,
+            ))
+            allocated = torch.cuda.memory_allocated(device)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert torch.cuda.memory_allocated(device) == allocated
+            assert tuple(t.data_ptr() for t in (*state, binding.scratch, binding.output)) == addresses
+            if boundaries != (0, 2):
+                assert torch.all(binding.state_errors[:2] != 0)
+                assert torch.all(binding.request_errors != 0)
+                assert torch.isnan(result).all()
+                assert torch.all(binding.selected_positions == -1)
+                for tensor, saved in zip(state, initial, strict=True):
+                    assert torch.equal(tensor, saved)
+            else:
+                assert torch.all(binding.state_errors[:2] == 0)
+                assert torch.all(binding.request_errors == 0)
+                assert torch.equal(result, torch.zeros_like(result))
+                assert torch.equal(binding.raw_k_ring[0, :2], dynamic["raw_index_key"])
+                assert torch.equal(binding.raw_logical_positions[0, :2], dynamic["query_positions"])
+                assert torch.equal(binding.raw_rope_positions[0, :2], dynamic["rope_positions"])
+                assert int(binding.raw_interval_start_positions[0]) == 1
 
 
 def test_qsa_shared_pool_cuda_graph_replay_has_stable_addresses_and_allocation() -> (
@@ -2151,23 +2220,64 @@ def test_qsa_group_budget_2048_executes_full_decode() -> None:
     assert torch.all(binding.selected_positions[0, 4:] == -1)
 
 
+def _large_offset_caps(device, raw_slots):
+    # Derive strides from the declaration, not a separate assumed head size.
+    # Large pages keep slot-scaled workspaces bounded while real addresses still
+    # cross signed-int32 products. No CUDA tensor is allocated by this helper.
+    caps = _caps(device, max_batch=1, max_raw_state_slots=1, max_q_rows=1,
+                 main_page_size=16384, compressed_page_size=4096)
+    page_elements = caps.compressed_page_size * caps.index_head_dim
+    stride = (page_elements * torch.bfloat16.itemsize // torch.int64.itemsize
+              if raw_slots else page_elements)
+    high = (2**31 - 1) // stride + 1
+    caps = replace(caps, num_compressed_cache_pages=high + 1,
+                   max_raw_state_slots=high + 1 if raw_slots else 1)
+    pool_nbytes = (high + 1) * page_elements * torch.bfloat16.itemsize
+    assert high * stride > 2**31 - 1
+    assert caps.num_compressed_cache_pages <= 20000
+    assert 2 * pool_nbytes + 6 * 2**30 < 40 * 2**30
+    return caps, high, pool_nbytes
+
+
+def _large_offset_required_bytes(caps, pool_nbytes):
+    # Cover retained preparation snapshots and both preparation/serving scratch.
+    # Counting raw views separately also bounds a future accidental materialization.
+    scratch = qsa_contract._scratch_layout(caps)[0].total_nbytes
+    main_kv = (2 * caps.num_main_cache_pages * caps.main_page_size
+               * caps.kv_heads * caps.head_dim * caps.kv_dtype.itemsize)
+    raw = caps.max_raw_state_slots * (
+        caps.raw_ring_capacity * caps.index_head_dim * torch.bfloat16.itemsize
+        + (caps.raw_ring_capacity * (1 + caps.position_axes) + 1) * torch.int64.itemsize
+    )
+    small = (caps.max_q_rows * (caps.q_heads * caps.head_dim * 2 + caps.selection_width * 4)
+             + 2 * caps.max_seq_len * (caps.index_rotary_dim // 2) * 4
+             + caps.max_batch * (caps.main_table_width + caps.compressed_table_width) * 4)
+    required = 2 * pool_nbytes + 3 * scratch + main_kv + 2 * raw + 4 * small + 6 * 2**30
+    assert required < 48 * 2**30, "Large-offset test exceeds its reviewed memory envelope"
+    return required
+
+
+def _require_large_offset_memory(device, required):
+    _require_free_cuda_bytes(device, required)
+    # GB10 CUDA allocations share host RAM; CUDA free bytes alone are insufficient.
+    from pathlib import Path
+    meminfo = Path('/proc/meminfo')
+    if meminfo.is_file():
+        fields = dict(line.split(':', 1) for line in meminfo.read_text().splitlines())
+        available = int(fields['MemAvailable'].split()[0]) * 1024
+        if available < required:
+            pytest.skip("Insufficient host RAM for the bounded large-offset test")
+
+
 def test_qsa_compressed_page_addressing_crosses_signed_int32_product() -> None:
     device = require_sm120()
-    page_elements = 8 * 16
-    high_page = torch.iinfo(torch.int32).max // page_elements + 1
-    page_count = high_page + 1
-    pool_nbytes = page_count * page_elements * torch.bfloat16.itemsize
-    _require_free_cuda_bytes(device, pool_nbytes + 2 * 2**30)
+    caps, high_page, pool_nbytes = _large_offset_caps(device, False)
+    # Preparation snapshots the compressed cache once, so the peak is two
+    # pools plus workspaces.
+    _require_large_offset_memory(device, _large_offset_required_bytes(caps, pool_nbytes))
     binding: qsa.Binding | None = None
     dynamic: dict[str, torch.Tensor] | None = None
     try:
-        caps = _caps(
-            device,
-            max_batch=1,
-            max_raw_state_slots=1,
-            max_q_rows=1,
-            num_compressed_cache_pages=page_count,
-        )
         try:
             binding = _allocate_binding(caps)
         except torch.OutOfMemoryError:
@@ -2201,25 +2311,20 @@ def test_qsa_compressed_page_addressing_crosses_signed_int32_product() -> None:
 
 def test_qsa_raw_state_slot_addressing_crosses_signed_int32_products() -> None:
     device = require_sm120()
-    page_elements = 8 * 16
-    page_i64 = page_elements * torch.bfloat16.itemsize // torch.int64.itemsize
-    high_slot = torch.iinfo(torch.int32).max // page_i64 + 1
-    page_count = high_slot + 1
-    pool_nbytes = page_count * page_elements * torch.bfloat16.itemsize
-    _require_free_cuda_bytes(device, pool_nbytes + 3 * 2**30)
+    caps, high_slot, pool_nbytes = _large_offset_caps(device, True)
+    # Preparation snapshots the pool once, so the peak is two pools plus the
+    # per-slot metadata and workspaces.
+    _require_large_offset_memory(device, _large_offset_required_bytes(caps, pool_nbytes))
     binding: qsa.Binding | None = None
     dynamic: dict[str, torch.Tensor] | None = None
     try:
-        caps = _caps(
-            device,
-            max_batch=1,
-            max_raw_state_slots=page_count,
-            max_q_rows=1,
-            num_compressed_cache_pages=page_count,
-        )
         try:
             binding = _allocate_shared_compressed_raw_binding(
-                caps, initialize_metadata=False
+                caps, initialize_metadata=False,
+                plan=qsa.plan(caps, invocation=_invocation(
+                    caps, shared_pool=True,
+                    raw_state_slot_ids={"dtype": "int32", "strides": (2,)},
+                )),
             )
         except torch.OutOfMemoryError:
             pytest.skip("CUDA allocator could not reserve the high-slot QSA pool")
@@ -2231,8 +2336,9 @@ def test_qsa_raw_state_slot_addressing_crosses_signed_int32_products() -> None:
         binding.main_block_table[0, 0] = 0
         binding.main_k_cache.zero_()
         binding.main_v_cache.zero_()
+        # Request IDs keep the dtype the plan was prepared with; the int32
+        # products under test are the raw-slot and page strides.
         dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
-        dynamic["request_ids"] = dynamic["request_ids"].to(torch.int32)
 
         result = qsa.run(binding, **dynamic)
 
@@ -3051,6 +3157,7 @@ def test_qsa_score_uses_tensor_device_and_stream() -> None:
         assert tuple(implementation._CACHE.items()) == warmed
 
 
+@pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("budget", [2048, 8192])
 @pytest.mark.parametrize("output_rows", [4, 66])
@@ -3058,6 +3165,7 @@ def test_qsa_run_prewarm_covers_bound_capacity_and_graph_replay(
     overlap: bool,
     budget: int,
     output_rows: int,
+    request_dtype: torch.dtype,
 ) -> None:
     from b12x._lib.runtime_control import kernel_resolution_guard
 
@@ -3073,7 +3181,21 @@ def test_qsa_run_prewarm_covers_bound_capacity_and_graph_replay(
         max_speculative_tokens=3,
         budget=budget,
     )
-    binding = _allocate_binding(caps)
+    # Each request-ID dtype is a distinct prepared ABI; runtime rows must use
+    # the dtype the plan was prepared with rather than being cast afterwards.
+    binding = _allocate_binding(
+        caps,
+        plan=qsa.plan(
+            caps,
+            invocation=_invocation(
+                caps,
+                request_ids={
+                    "dtype": qsa_contract._dtype_name(request_dtype),
+                    "strides": (1,),
+                },
+            ),
+        ),
+    )
     binding = _rebind(
         binding,
         output=binding.output[:output_rows],
@@ -3098,41 +3220,40 @@ def test_qsa_run_prewarm_covers_bound_capacity_and_graph_replay(
     pointers = tuple(t.data_ptr() for t in buffers)
     completion_event = binding._selection_done
     with kernel_resolution_guard('QSA run uses prewarmed capacity across live rows'):
-        for dtype in (torch.int32, torch.int64):
-            for rows in sorted({1, min(4, output_rows), output_rows}):
-                dynamic = _dynamic_inputs(
-                    binding,
-                    positions=(0,) + (-1,) * (rows - 1),
-                    request_ids=(0,) + (-1,) * (rows - 1),
-                )
-                dynamic["request_ids"] = dynamic["request_ids"].to(dtype)
+        for rows in sorted({1, min(4, output_rows), output_rows}):
+            dynamic = _dynamic_inputs(
+                binding,
+                positions=(0,) + (-1,) * (rows - 1),
+                request_ids=(0,) + (-1,) * (rows - 1),
+            )
+            assert dynamic["request_ids"].dtype is request_dtype
 
-                def invoke():
-                    if ready is not None:
-                        ready.record()
-                    return qsa.run(binding, **dynamic, index_ready=ready)
+            def invoke():
+                if ready is not None:
+                    ready.record()
+                return qsa.run(binding, **dynamic, index_ready=ready)
 
-                graph = _cuda_graph()
-                with torch.cuda.graph(graph):
-                    result = invoke()
-                for value in (1, 2):
-                    binding.raw_interval_start_positions.fill_(-1)
-                    binding.main_v_cache.fill_(value)
-                    binding.output.fill_(float("nan"))
-                    torch.cuda.synchronize()
-                    before = torch.cuda.memory_stats()
-                    graph.replay()
-                    torch.cuda.synchronize()
-                    after = torch.cuda.memory_stats()
-                    for key in (
-                        "allocation.all.allocated",
-                        "allocated_bytes.all.allocated",
-                    ):
-                        assert after[key] == before[key]
-                    assert torch.all(result[0] == value)
-                    assert torch.all(result[1:] == 0)
-                    assert tuple(t.data_ptr() for t in buffers) == pointers
-                    assert binding._selection_done is completion_event
+            graph = _cuda_graph()
+            with torch.cuda.graph(graph):
+                result = invoke()
+            for value in (1, 2):
+                binding.raw_interval_start_positions.fill_(-1)
+                binding.main_v_cache.fill_(value)
+                binding.output.fill_(float("nan"))
+                torch.cuda.synchronize()
+                before = torch.cuda.memory_stats()
+                graph.replay()
+                torch.cuda.synchronize()
+                after = torch.cuda.memory_stats()
+                for key in (
+                    "allocation.all.allocated",
+                    "allocated_bytes.all.allocated",
+                ):
+                    assert after[key] == before[key]
+                assert torch.all(result[0] == value)
+                assert torch.all(result[1:] == 0)
+                assert tuple(t.data_ptr() for t in buffers) == pointers
+                assert binding._selection_done is completion_event
 
 
 @pytest.mark.parametrize("overlap", [False, True])

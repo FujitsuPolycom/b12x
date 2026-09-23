@@ -15,6 +15,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
@@ -30,6 +32,21 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
 _CACHE: dict[tuple, object] = {}
 register_program_cache(_CACHE)
 _THREADS = 128
+
+
+@dsl_user_op
+def _or_error(address: Int64, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [address.ir_value(loc=loc, ip=ip)],
+        "red.relaxed.gpu.global.or.b32 [$0], 512;",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 class _RepresentativeScoreKernel:
@@ -65,6 +82,7 @@ class _RepresentativeScoreKernel:
         query,
         cache,
         table,
+        errors,
         scores,
         request,
         row,
@@ -72,6 +90,7 @@ class _RepresentativeScoreKernel:
         token_stride,
         table_stride,
         score_row,
+        page_count,
         group_offset,
         group_count,
         local_start,
@@ -97,12 +116,14 @@ class _RepresentativeScoreKernel:
                     page = table[
                         request * table_stride + (group // self.page_size).to(Int64)
                     ].to(Int64)
-                    if page >= Int64(0):
+                    if (page >= Int64(0)) & (page < page_count):
                         base[part] = (
                             page * page_stride
                             + (group % self.page_size).to(Int64) * token_stride
                         )
                         valid[part] = Int32(1)
+                    elif matrix_pair == 0:
+                        _or_error((errors + row.to(Int64)).toint().to(Int64))
             d0, d1, d2, d3 = Float32(0), Float32(0), Float32(0), Float32(0)
             for tile in cutlass.range_constexpr(self.dim // 16):
                 mma_column = (tile * 16 + matrix_pair * 2).to(Int64)
@@ -167,11 +188,12 @@ class _RepresentativeScoreKernel:
         pointers: tuple,
         strides: tuple,
         rows: Int32,
+        page_count: Int64,
         group_offset: Int32,
         group_count: Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(pointers, strides, group_offset, group_count).launch(
+        self.kernel(pointers, strides, page_count, group_offset, group_count).launch(
             grid=((group_count + self.groups - 1) // self.groups, rows, 1),
             block=(_THREADS, 1, 1),
             stream=stream,
@@ -182,6 +204,7 @@ class _RepresentativeScoreKernel:
         self,
         pointers: tuple,
         strides: tuple,
+        page_count: Int64,
         group_offset: Int32,
         group_count: Int32,
     ):
@@ -192,6 +215,7 @@ class _RepresentativeScoreKernel:
             lengths,
             cache,
             table,
+            errors,
             scores,
             counts,
             merges,
@@ -203,7 +227,7 @@ class _RepresentativeScoreKernel:
         warp = thread // 32
         request = requests[row].to(Int64)
         eligible = Int32(0)
-        if request >= Int64(0):
+        if (errors[row] == Int32(0)) & (request >= Int64(0)):
             position_groups = (positions[row].to(Int64) + Int64(1)) // self.ratio
             sequence_groups = lengths[request].to(Int64) // self.ratio
             eligible = cutlass.min(
@@ -228,6 +252,7 @@ class _RepresentativeScoreKernel:
                 query,
                 cache,
                 table,
+                errors,
                 scores,
                 request,
                 row,
@@ -235,6 +260,7 @@ class _RepresentativeScoreKernel:
                 token_stride,
                 table_stride,
                 score_row,
+                page_count,
                 group_offset,
                 group_count,
                 local_start,
@@ -266,7 +292,7 @@ class _RepresentativeScoreKernel:
                     page = table[request * table_stride + logical_page.to(Int64)].to(
                         Int64
                     )
-                    if page >= Int64(0):
+                    if (page >= Int64(0)) & (page < page_count):
                         key = cute.make_rmem_tensor((self.lane_values,), Float32)
                         key_base = (
                             page * page_stride
@@ -289,6 +315,8 @@ class _RepresentativeScoreKernel:
                                 )
                             score = score + cutlass.max(dot, Float32(0))
                         score = score * Float32(self.scale)
+                    elif lane == 0:
+                        _or_error((errors + row.to(Int64)).toint().to(Int64))
                 if (lane == 0) & (local_group < group_count):
                     scores[score_row + (carry + local_group).to(Int64)] = score
 
@@ -307,6 +335,7 @@ def compile_score_representatives(
     sequence_lengths,
     compressed_cache,
     compressed_block_table,
+    state_errors,
     scores,
     eligible_counts,
     merge_lengths,
@@ -315,7 +344,7 @@ def compile_score_representatives(
     """Resolve the exact configured CuTe score executable for QSA preparation."""
     tensors = (
         prepared_query, query_positions, request_ids, sequence_lengths,
-        compressed_cache, compressed_block_table, scores,
+        compressed_cache, compressed_block_table, state_errors, scores,
         eligible_counts, merge_lengths,
     )
     types = tuple(
@@ -337,17 +366,21 @@ def compile_score_representatives(
         key = (device_index, geometry, tuple(t.dtype for t in tensors))
         raw = _CACHE.get(key)
         if raw is None:
-            kernel = _RepresentativeScoreKernel(*geometry)
+            if geometry[0] == 4 and geometry[1] % 16 == 0:
+                from ._score_pair_cute import PairedRepresentativeScoreKernel
+                kernel = PairedRepresentativeScoreKernel(*geometry)
+            else:
+                kernel = _RepresentativeScoreKernel(*geometry)
             raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
             fake = tuple(
                 make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=t.width // 8)
                 for t in types
             )
             raw = b12x_compile(
-                kernel, fake, (Int64(1),) * 4, Int32(1), Int32(0),
+                kernel, fake, (Int64(1),) * 4, Int32(1), Int64(1), Int32(0),
                 Int32(1), current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
-                    "attention.qsa.representative_score", 1, key
+                    "attention.qsa.representative_score", 3, key
                 ),
             )
             _CACHE[key] = raw
@@ -362,6 +395,7 @@ def launch_score_representatives(
     sequence_lengths,
     compressed_cache,
     compressed_block_table,
+    state_errors,
     scores,
     eligible_counts,
     merge_lengths,
@@ -377,6 +411,7 @@ def launch_score_representatives(
         sequence_lengths,
         compressed_cache,
         compressed_block_table,
+        state_errors,
         scores,
         eligible_counts,
         merge_lengths,
@@ -397,6 +432,7 @@ def launch_score_representatives(
         sequence_lengths=sequence_lengths,
         compressed_cache=compressed_cache,
         compressed_block_table=compressed_block_table,
+        state_errors=state_errors,
         scores=scores,
         eligible_counts=eligible_counts,
         merge_lengths=merge_lengths,
@@ -415,6 +451,7 @@ def launch_score_representatives(
             Int64(scores.stride(0)),
         ),
         Int32(prepared_query.shape[0]),
+        Int64(compressed_cache.shape[0]),
         Int32(group_offset),
         Int32(group_count),
         current_cuda_stream(),

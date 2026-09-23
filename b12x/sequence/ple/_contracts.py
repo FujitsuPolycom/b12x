@@ -474,6 +474,37 @@ def _bind_layer(
     )
 
 
+def export_checkpoint(
+    binding: LayerBinding, *, offsets: torch.Tensor, slots: torch.Tensor
+) -> None:
+    """Export an interior prefill window after the preceding ``run_mixed``.
+
+    Offsets are query-relative and strictly interior. Nonpositive offsets,
+    negative destinations, decode rows, empty rows, and offsets at or beyond
+    the query end do nothing. Enabled destinations must be valid, distinct
+    pool slots separate from every live input/output slot. The caller must
+    export before reusing the binding's normalized-input and history scratch.
+
+    Mixed-plan preparation compiles this kernel; offsets and slots remain device
+    inputs and may change during CUDA graph replay without kernel resolution.
+    """
+    caps = binding._state.caps
+    if caps.mode != "mixed":
+        raise ValueError("checkpoint export requires a mixed LayerPlan")
+    for name, tensor, dtype in (
+        ("checkpoint offsets", offsets, torch.int32),
+        ("checkpoint slots", slots, torch.int64),
+    ):
+        _require_tensor(
+            name, tensor, shape=(caps.max_seqs,), dtype=dtype, device=caps.device
+        )
+    if caps.device.type != "cuda":
+        raise ValueError("PLE GPU run requires CUDA; use the explicit reference oracle")
+    from ._checkpoint import export_layer_checkpoint
+
+    export_layer_checkpoint(binding, offsets=offsets, slots=slots)
+
+
 def run_decode(binding: LayerBinding, *, eps: float) -> torch.Tensor:
     """Run decode and mutate only live nonnegative state slots."""
     if binding._state.caps.mode != "decode":
@@ -540,6 +571,7 @@ __all__ = [
     "LayerBinding",
     "plan_layer",
     "bind_layer",
+    "export_checkpoint",
     "run_decode",
     "run_prefill",
     "run_mixed",

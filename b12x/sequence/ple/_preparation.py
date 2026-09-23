@@ -9,6 +9,7 @@ import torch
 import triton
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.compile_plan import load_programs
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._contracts import LayerCaps, _bind_layer, _materialize_layout
 from ._tuning import OPERANDS, PleConfig, PleQuery, TUNING
@@ -82,7 +83,7 @@ def compile_layer(query_payload, config_payload, ordinal):
         num_warps=4, grid=(n, channel_grid),
     )
     with torch.cuda.device(ordinal):
-        return (
+        programs = (
             kernels._request_ids_kernel.warmup(
                 p["query_start_loc"], p["num_seqs"], p["num_tokens"], p["request_ids"],
                 MAX_TOKENS=m, num_warps=1, grid=(m,),
@@ -109,6 +110,10 @@ def compile_layer(query_payload, config_payload, ordinal):
                 p["request_is_prefill"], p["num_seqs"], p["conv_state"], **state_options,
             ),
         )
+        if mixed:
+            from ._checkpoint import compile_checkpoint
+            programs += (compile_checkpoint(query, ordinal),)
+        return programs
 
 
 def _binding_tensors(binding, token_count=None):
@@ -240,9 +245,14 @@ def make_plan(caps: LayerCaps, *, invocation, override):
         return MemoryRequirements(scratch=_materialize_layout(caps, config).scratch_specs())
 
     def materialize(selection, device):
+        # Checkpoint export is not executed by ordinary PLE priming. Load every
+        # declared program here so its module is owned before graph capture.
+        programs = load_programs(
+            compile_layer(query_payload, selection.config.to_dict(), device.ordinal)
+        )
         return _PleState(
             query, _materialize_layout(caps, selection.config),
-            compile_layer(query_payload, selection.config.to_dict(), device.ordinal),
+            programs,
         )
 
     return Plan(

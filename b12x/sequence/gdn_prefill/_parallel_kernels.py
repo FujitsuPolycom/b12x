@@ -168,7 +168,8 @@ class _BoundaryKernel(_RecurrenceKernel):
                  v_split: int, null_state_index: int | None) -> None:
         super().__init__(heads=heads, tiles_capacity=1, window_tiles=1,
                          rows=max_seqs, v_split=v_split, k_split=1, stages=2,
-                         checkpoint_export=False, null_state_index=null_state_index,
+                         checkpoint_export=False, max_checkpoints=1,
+                         null_state_index=null_state_index,
                          index_type=Int32)
         self.max_segments = max_segments
 

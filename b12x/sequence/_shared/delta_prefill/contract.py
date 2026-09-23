@@ -56,6 +56,7 @@ class Layout:
     stages: int
     window_tiles: int
     max_windows: int
+    duplicate_table_size: int
     offsets: Mapping[str, int]
     _scratch_specs: tuple[ScratchBufferSpec, ...]
     workspace_windows: int = 2
@@ -99,6 +100,8 @@ class Binding:
 
     _state: Layout
     scratch: torch.Tensor
+    error_code: torch.Tensor
+    duplicate_slots: torch.Tensor
     band_base: torch.Tensor
     sorted_seq: torch.Tensor
     rank_of: torch.Tensor
@@ -128,6 +131,10 @@ class Binding:
     plan: Plan | None = None
 
 
+def _next_power_of_two(value: int) -> int:
+    return 1 << max(0, int(value) - 1).bit_length()
+
+
 def materialize_layout(
     caps: PrefillCaps,
     *,
@@ -150,7 +157,10 @@ def materialize_layout(
     if workspace_windows == 1 and max_windows != 1:
         raise ValueError("one workspace window requires a single-window plan")
     ring_records = workspace_windows * window_tiles * heads
+    duplicate_table_size = _next_power_of_two(2 * (1 + getattr(caps, "max_checkpoints", 1)) * caps.max_seqs)
     regions = (
+        ("error_code", 1, torch.int32),
+        ("duplicate_slots", duplicate_table_size, torch.int32),
         ("band_base", tiles + 2, torch.int32),
         ("sorted_seq", caps.max_seqs, torch.int32),
         ("rank_of", caps.max_seqs, torch.int32),
@@ -174,6 +184,7 @@ def materialize_layout(
         stages=int(stages),
         window_tiles=window_tiles,
         max_windows=max_windows,
+        duplicate_table_size=duplicate_table_size,
         offsets=offsets,
         _scratch_specs=(spec,),
         workspace_windows=workspace_windows,
@@ -257,11 +268,8 @@ def bind_tensors(
     )
     require_tensor("cu_seqlens", cu_seqlens, shape=(seq_capacity + 1,), device=device, dtypes=(torch.int32,))
     index_dtypes = (torch.int32, torch.int64)
-    for name, tensor in (
-        ("initial_state_indices", initial_state_indices),
-        ("checkpoint_state_indices", checkpoint_state_indices),
-    ):
-        require_tensor(name, tensor, shape=(seq_capacity,), device=device, dtypes=index_dtypes)
+    require_tensor("initial_state_indices", initial_state_indices,
+                   shape=(seq_capacity,), device=device, dtypes=index_dtypes)
     require_tensor(
         "final_state_indices",
         final_state_indices,
@@ -272,10 +280,14 @@ def bind_tensors(
     )
     if final_state_indices.stride(0) <= 0:
         raise ValueError("final_state_indices must have a positive stride")
+    checkpoints = getattr(caps, "max_checkpoints", 1)
+    checkpoint_shape = (seq_capacity,) if checkpoints == 1 else (seq_capacity, checkpoints)
+    require_tensor("checkpoint_state_indices", checkpoint_state_indices,
+                   shape=checkpoint_shape, device=device, dtypes=index_dtypes)
     if not (initial_state_indices.dtype == final_state_indices.dtype == checkpoint_state_indices.dtype):
         raise TypeError("state index tensors must share one dtype")
     require_tensor(
-        "checkpoint_offsets", checkpoint_offsets, shape=(seq_capacity,), device=device, dtypes=(torch.int32,)
+        "checkpoint_offsets", checkpoint_offsets, shape=checkpoint_shape, device=device, dtypes=(torch.int32,)
     )
     for name, tensor in (("num_seqs", num_seqs), ("num_tokens", num_tokens)):
         require_tensor(name, tensor, shape=(1,), device=device, dtypes=(torch.int32,))
@@ -284,6 +296,8 @@ def bind_tensors(
     storage = scratch_tensor(scratch, plan.scratch_specs(), owner=caps.op_name)
     ring = plan.workspace_windows * plan.window_tiles
     views = {
+        "error_code": _record_view(storage, plan, "error_code", (1,), torch.int32),
+        "duplicate_slots": _record_view(storage, plan, "duplicate_slots", (plan.duplicate_table_size,), torch.int32),
         "band_base": _record_view(storage, plan, "band_base", (tiles + 2,), torch.int32),
         "sorted_seq": _record_view(storage, plan, "sorted_seq", (caps.max_seqs,), torch.int32),
         "rank_of": _record_view(storage, plan, "rank_of", (caps.max_seqs,), torch.int32),

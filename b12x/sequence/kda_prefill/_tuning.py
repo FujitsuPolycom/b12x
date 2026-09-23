@@ -34,6 +34,8 @@ class KdaPrefillQuery:
     max_tokens: int
     max_seqs: int
     max_state_slots: int = 1
+    max_checkpoints: int = 1
+    metadata_validation: str = "transactional"
     null_state_index: int | None = None
     a_log_dtype: str = "float32"
     dt_bias_dtype: str = "float32"
@@ -48,6 +50,8 @@ class KdaPrefillQuery:
             "state_dtype": str(self.state_dtype),
             "qk_l2norm": bool(self.qk_l2norm),
             "checkpoint_export": bool(self.checkpoint_export),
+            "max_checkpoints": self.max_checkpoints,
+            "metadata_validation": self.metadata_validation,
             "max_tokens": int(self.max_tokens),
             "max_seqs": int(self.max_seqs),
             "max_state_slots": self.max_state_slots,
@@ -81,6 +85,12 @@ def _validate_query(query: KdaPrefillQuery, device) -> None:
     if not isinstance(query, KdaPrefillQuery):
         raise TypeError("query must be KdaPrefillQuery")
     validate_metadata_query(query)
+    if type(query.max_checkpoints) is not int or query.max_checkpoints not in (1, 2, 4):
+        raise ValueError("max_checkpoints must be 1, 2 or 4")
+    if query.metadata_validation not in ("transactional", "trusted"):
+        raise ValueError("metadata_validation must be transactional or trusted")
+    if query.max_checkpoints > 1 and (not query.checkpoint_export or query.metadata_validation != "transactional"):
+        raise ValueError("multiple checkpoints require checkpoint_export and transactional validation")
     if query.head_dim != 128:
         raise ValueError(f"sequence.kda_prefill requires head_dim 128, got {query.head_dim}")
     if query.model_dtype != "bfloat16" or query.state_dtype != "float32":
@@ -130,14 +140,14 @@ def _encode_query(query: KdaPrefillQuery) -> dict[str, object]:
 
 
 TUNING = TuningContract(
-    component_id="sequence.kda_prefill", query_schema_version=5, config_schema_version=1,
+    component_id="sequence.kda_prefill", query_schema_version=6, config_schema_version=1,
     query_fields=_KEY_FIELDS,
     config_fields=frozenset({"backend", "v_split", "k_split", "stages", "window_tiles"}),
     encode_query=_encode_query, encode_config=KdaPrefillConfig.to_dict,
     decode_config=KdaPrefillConfig.from_config, validate_query=_validate_query,
     validate_config=_validate_config, default_config=_default_config,
     knobs=(Knob(name="backend", values=(BACKEND,), binding=ParameterBinding.COMPILE), Knob(name="v_split", values=V_SPLIT_CHOICES, binding=ParameterBinding.COMPILE), Knob(name="k_split", values=K_SPLIT_CHOICES, binding=ParameterBinding.COMPILE), Knob(name="stages", values=STAGE_CHOICES, binding=ParameterBinding.COMPILE), Knob(name="window_tiles", values=None, binding=ParameterBinding.COMPILE)),
-    candidate_contract_version=3, parameters=_tuning_parameters,
+    candidate_contract_version=4, parameters=_tuning_parameters,
 )
 
 __all__ = ["BACKEND", "CHUNK_TOKENS", "K_SPLIT_CHOICES", "KdaPrefillConfig", "KdaPrefillQuery", "STAGE_CHOICES", "V_SPLIT_CHOICES", "WINDOW_BYTES_BUDGET", "WORKSPACE_RECORD_BYTES", "WorkspaceRecord", "default_window_tiles", "tiles_capacity", "TUNING"]

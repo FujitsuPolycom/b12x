@@ -156,6 +156,45 @@ def _offline_compiler_spawn_environment():
                 os.environ["CUDA_VISIBLE_DEVICES"] = previous
 
 
+def _parse_compiler_cpu_affinity(value: str) -> set[int]:
+    """Parse an explicit Linux CPU list without consulting serving affinity."""
+    cpus = set()
+    for part in value.split(","):
+        bounds = part.strip().split("-")
+        if len(bounds) not in (1, 2) or any(
+            not bound or not bound.isascii() or not bound.isdecimal()
+            for bound in bounds
+        ):
+            raise ValueError("B12X_COMPILE_CPU_AFFINITY requires CPU IDs or inclusive ranges")
+        first, last = int(bounds[0]), int(bounds[-1])
+        if first > last:
+            raise ValueError("B12X_COMPILE_CPU_AFFINITY contains a descending CPU range")
+        cpus.update(range(first, last + 1))
+    return cpus
+
+
+def _configure_compiler_cpu_affinity() -> None:
+    """Apply an opt-in CPU mask to this compiler child, never its parent."""
+    value = os.environ.get("B12X_COMPILE_CPU_AFFINITY")
+    if value is None:
+        return
+    requested = _parse_compiler_cpu_affinity(value)
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        raise RuntimeError("B12X_COMPILE_CPU_AFFINITY requires Linux scheduler affinity")
+    previous = os.sched_getaffinity(0)
+    try:
+        os.sched_setaffinity(0, requested)
+        # Linux silently intersects a requested mask with cgroup/online CPUs.
+        # Accept only the exact declared placement; do not disguise a subset.
+        if os.sched_getaffinity(0) != requested:
+            raise RuntimeError("the kernel accepted only part of the requested CPU mask")
+    except Exception as error:
+        os.sched_setaffinity(0, previous)
+        raise RuntimeError(
+            f"B12X_COMPILE_CPU_AFFINITY={value!r} could not be applied exactly"
+        ) from error
+
+
 def _initialize_worker(
     device_ordinal: int,
     compute_capability: tuple[int, int],
@@ -170,6 +209,7 @@ def _initialize_worker(
     # Hiding devices before importing CUDA-aware libraries prevents an
     # accidental runtime or driver call from retaining a device context.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    _configure_compiler_cpu_affinity()
     import torch
     from triton import knobs
     from . import compiler

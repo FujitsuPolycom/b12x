@@ -528,6 +528,7 @@ class DraftSelectionPlan:
                 torch.int32,
             ),
             ("logical_positions", (self.max_source_rows,), torch.int64),
+            ("errors", (self.max_source_rows,), torch.int32),
             ("num_source_rows", (1,), torch.int32),
         ):
             offset = _align_up(offset)
@@ -565,10 +566,9 @@ class DraftSelectionState:
     Ordinary ``run`` replaces the valid anchor prefix. Reuse preserves it.
     The caller must reset before first use, at round boundaries, and before
     recycling requests; it must map each request to an anchor from that same
-    request and round. A mapping outside the recorded row count or a query
-    position outside the anchor's causal tail selects no positions for that
-    row. Request identity and round provenance are caller invariants and
-    cannot be inferred from logical positions.
+    request and round. Bounds, recorded row count, error bits, and causal tail
+    positions are checked on device. Request identity and round provenance are
+    caller invariants and cannot be inferred from logical positions.
 
     Reset, recording, map updates, and reuse must be ordered on the calling
     stream or joined with caller-established events. Concurrent operations
@@ -595,14 +595,18 @@ class DraftSelectionState:
         return self._view(1)
 
     @property
-    def num_source_rows(self) -> torch.Tensor:
+    def errors(self) -> torch.Tensor:
         return self._view(2)
+
+    @property
+    def num_source_rows(self) -> torch.Tensor:
+        return self._view(3)
 
     def reset(self) -> None:
         """Invalidate all anchors on the calling stream without allocating storage."""
         from ._draft_selection import reset_anchors
 
-        reset_anchors(self._storage, self.plan._regions()[2][3])
+        reset_anchors(self._storage, self.plan._regions()[3][3])
 
 
 @dataclass(frozen=True)
@@ -630,6 +634,8 @@ class Binding:
 
     state: _MaterializedPlan
     plan: Plan | None
+    state_errors: torch.Tensor
+    request_errors: torch.Tensor
     shared_compressed_raw_pool: bool
     scratch: torch.Tensor
     main_k_cache: torch.Tensor
@@ -672,7 +678,9 @@ class _KernelCaps:
     """Scalar-only launch contract reconstructed inside the opaque op."""
 
     max_batch: int
+    max_raw_state_slots: int
     max_seq_len: int
+    main_page_size: int
     compressed_page_size: int
     q_heads: int
     kv_heads: int
@@ -798,7 +806,9 @@ def _scratch_layout(
         max(_MIN_TOPK_WORKSPACE_BYTES, stable_topk_nbytes)
     )
 
-    offset = 0
+    offset = (_align_up(caps.max_q_rows * torch.int32.itemsize)
+              + _align_up((caps.max_batch + 1) * torch.int32.itemsize)
+              + _align_up((caps.num_compressed_cache_pages + 1) * torch.int32.itemsize))
     prepared_query_offset = _align_up(offset)
     offset = prepared_query_offset + prepared_query_nbytes
     score_offset = _align_up(offset)
@@ -1145,7 +1155,7 @@ def compile_qsa(
     the real compiler carrier consumed by the prepared host adapters.
     """
     from ._draft_selection import _prepare_kernel, _record_kernel
-    from ._kernels import _support_context
+    from ._kernels import _support_context, launch_validate_page_tables, launch_validate_shared_pool_ownership
     from ._score_cute import compile_score_representatives
     from ._sparse_gqa import compile_sparse_paged_gqa
     from ..._lib.compile_plan import launch_triton
@@ -1252,6 +1262,7 @@ def compile_qsa(
                               shape=(state.workspace_q_rows,), dtype=torch.int32)
         kernel_caps = _KernelCaps(
             max_batch=caps.max_batch, max_seq_len=caps.max_seq_len,
+            max_raw_state_slots=caps.max_raw_state_slots, main_page_size=caps.main_page_size,
             compressed_page_size=caps.compressed_page_size, q_heads=caps.q_heads,
             kv_heads=caps.kv_heads, head_dim=caps.head_dim, index_heads=caps.index_heads,
             index_head_dim=caps.index_head_dim, index_rotary_dim=caps.index_rotary_dim,
@@ -1265,6 +1276,7 @@ def compile_qsa(
             prepared_query=prepared, query_positions=positions, request_ids=request_ids,
             sequence_lengths=sequence_lengths, compressed_cache=compressed,
             compressed_block_table=compressed_table,
+            state_errors=_scratch_view(scratch, offset_bytes=0, shape=(rows,), dtype=torch.int32),
             scores=scores, eligible_counts=eligible, merge_lengths=merge, caps=kernel_caps,
         )
         sparse = compile_sparse_paged_gqa(
@@ -1297,6 +1309,37 @@ def compile_qsa(
                 layout.partial_lse_offset_bytes,
                 programs=SimpleNamespace(support=support, score=score, sparse=sparse),
             )
+            # The transaction above never overlaps compressed and raw storage,
+            # so the shared-storage validators are compiled here with the same
+            # ABI for bindings whose compressed cache and raw ring share a pool.
+            launch_validate_page_tables(
+                request_ids=request_ids,
+                sequence_lengths=sequence_lengths,
+                main_block_table=main_table,
+                compressed_block_table=compressed_table,
+                raw_state_slot_ids=raw_slots,
+                state_errors=_scratch_view(scratch, offset_bytes=0, shape=(rows,), dtype=torch.int32),
+                num_main_pages=caps.num_main_cache_pages,
+                num_compressed_pages=caps.num_compressed_cache_pages,
+                shared_compressed_raw_pool=True,
+                caps=kernel_caps,
+            )
+            launch_validate_shared_pool_ownership(
+                request_ids=request_ids,
+                sequence_lengths=sequence_lengths,
+                compressed_block_table=compressed_table,
+                raw_state_slot_ids=raw_slots,
+                state_errors=_scratch_view(scratch, offset_bytes=0, shape=(rows,), dtype=torch.int32),
+                occupancy=_scratch_view(
+                    scratch,
+                    offset_bytes=_align_up(rows * torch.int32.itemsize)
+                    + _align_up((caps.max_batch + 1) * torch.int32.itemsize),
+                    shape=(caps.num_compressed_cache_pages + 1,),
+                    dtype=torch.int32,
+                ),
+                num_compressed_pages=caps.num_compressed_cache_pages,
+                caps=kernel_caps,
+            )
         if not support:
             raise RuntimeError("QSA support compilation produced no native programs")
         if caps.max_speculative_tokens:
@@ -1307,15 +1350,17 @@ def compile_qsa(
             draft_state = draft_plan.bind(storage=storage)
             draft["record"] = launch_triton(
                 _record_kernel, (rows,), positions,
-                draft_state.logical_positions, draft_state.num_source_rows,
+                _scratch_view(scratch, offset_bytes=0, shape=(rows,), dtype=torch.int32),
+                draft_state.logical_positions, draft_state.errors, draft_state.num_source_rows,
                 selected[:rows], draft_state.selected_positions, rows, 1,
                 WIDTH=caps.selection_width, BLOCK=triton.next_power_of_2(caps.selection_width),
             )
             draft["prepare"] = launch_triton(
-                _prepare_kernel, (rows,), draft_state.logical_positions,
+                _prepare_kernel, (rows,), draft_state.logical_positions, draft_state.errors,
                 draft_state.selected_positions, empty((caps.max_batch,), torch.int64),
                 draft_state.num_source_rows, empty((rows,), torch.int32), positions,
-                selected, rows, caps.max_q_rows, caps.max_batch,
+                selected, _scratch_view(scratch, offset_bytes=0, shape=(rows,), dtype=torch.int32),
+                rows, caps.max_q_rows, caps.max_batch,
                 WIDTH=caps.selection_width, TAIL=caps.max_speculative_tokens,
                 BLOCK=triton.next_power_of_2(caps.selection_width + caps.max_speculative_tokens),
                 num_warps=4,
@@ -2038,6 +2083,8 @@ def _bind_materialized(
     elif selection_done is not None:
         raise ValueError("selection_done requires selection_stream")
     return Binding(
+        state_errors=_scratch_view(scratch_storage, offset_bytes=0, shape=(caps.max_q_rows,), dtype=torch.int32),
+        request_errors=_scratch_view(scratch_storage, offset_bytes=_align_up(caps.max_q_rows * torch.int32.itemsize), shape=(caps.max_batch + 1,), dtype=torch.int32),
         selection_stream=selection_stream,
         _selection_done=selection_done,
         draft_selection=draft_selection,
@@ -2156,6 +2203,9 @@ def _qsa_decode_impl(
     programs: QsaPrograms | None = None,
 ) -> None:
     """Launch selector state updates, optionally followed by sparse attention."""
+    state_errors_offset_bytes = 0
+    request_errors_offset_bytes = _align_up(int(selected_positions.shape[0]) * torch.int32.itemsize)
+    work_metadata_offset_bytes = request_errors_offset_bytes + _align_up((int(main_block_table.shape[0]) + 1) * torch.int32.itemsize)
     rows = int(index_query.shape[0])
     q_heads = int(output.shape[1])
     head_dim = int(output.shape[2])
@@ -2169,7 +2219,9 @@ def _qsa_decode_impl(
     )
     caps = _KernelCaps(
         max_batch=int(main_block_table.shape[0]),
+        max_raw_state_slots=int(raw_k_ring.shape[0]),
         max_seq_len=int(max_seq_len),
+        main_page_size=int(main_k_cache.shape[1]),
         compressed_page_size=int(compressed_k_cache.shape[1]),
         q_heads=q_heads,
         kv_heads=int(main_k_cache.shape[2]),
@@ -2240,6 +2292,18 @@ def _qsa_decode_impl(
         shape=(work_rows, group_budget),
         dtype=torch.int32,
     )
+    state_errors = _scratch_view(
+        scratch,
+        offset_bytes=int(state_errors_offset_bytes),
+        shape=(max_q_rows,),
+        dtype=torch.int32,
+    )[:rows]
+    request_errors = _scratch_view(
+        scratch,
+        offset_bytes=int(request_errors_offset_bytes),
+        shape=(int(caps.max_batch) + 1,),
+        dtype=torch.int32,
+    )
     stable_topk_blocks = math.ceil(int(score_workspace_width) / _STABLE_TOPK_BLOCK)
     stable_offset = int(topk_offset_bytes)
     stable_count_nbytes = work_rows * stable_topk_blocks * torch.int32.itemsize
@@ -2296,21 +2360,103 @@ def _qsa_decode_impl(
         shape=(int(max_split_row_product), q_heads),
         dtype=torch.float32,
     )
+    shared_compressed_raw_pool = any(
+        _overlaps(compressed_k_cache, raw_tensor)
+        for raw_tensor in (
+            raw_k_ring,
+            raw_logical_positions,
+            raw_rope_positions,
+            raw_interval_start_positions,
+        )
+    )
+    shared_page_occupancy = _scratch_view(
+        scratch,
+        offset_bytes=int(work_metadata_offset_bytes),
+        shape=(int(compressed_k_cache.shape[0]) + 1,),
+        dtype=torch.int32,
+    )
+
     from ._kernels import (
         launch_compress_completed_groups,
         launch_expand_selected_groups,
+        launch_poison_failed_rows,
         launch_prepare_index_query,
+        launch_propagate_request_errors,
         launch_stabilize_topk,
         launch_stage_topk_carry,
         launch_topk_groups,
         launch_commit_raw_ring,
+        launch_validate_completed_groups,
+        launch_validate_rows,
+        launch_validate_page_tables,
+        launch_validate_shared_pool_ownership,
     )
     from ._score_cute import launch_score_representatives
 
+    launch_validate_rows(
+        request_ids=request_ids,
+        query_positions=query_positions,
+        rope_positions=rope_positions,
+        sequence_lengths=sequence_lengths,
+        query_start_loc=query_start_loc,
+        num_accepted_tokens=num_accepted_tokens,
+        is_prefilling=is_prefilling,
+        raw_state_slot_ids=raw_state_slot_ids,
+        raw_interval_start_positions=raw_interval_start_positions,
+        request_errors=request_errors,
+        state_errors=state_errors,
+        rope_position_rows=int(rope_cos.shape[0]),
+        caps=caps,
+        _prepared=None if programs is None else programs.support,
+    )
+    launch_validate_page_tables(
+        request_ids=request_ids,
+        sequence_lengths=sequence_lengths,
+        main_block_table=main_block_table,
+        compressed_block_table=compressed_block_table,
+        raw_state_slot_ids=raw_state_slot_ids,
+        state_errors=state_errors,
+        num_main_pages=int(main_k_cache.shape[0]),
+        num_compressed_pages=int(compressed_k_cache.shape[0]),
+        shared_compressed_raw_pool=shared_compressed_raw_pool,
+        caps=caps,
+        _prepared=None if programs is None else programs.support,
+    )
+    if shared_compressed_raw_pool:
+        launch_validate_shared_pool_ownership(
+            request_ids=request_ids,
+            sequence_lengths=sequence_lengths,
+            compressed_block_table=compressed_block_table,
+            raw_state_slot_ids=raw_state_slot_ids,
+            state_errors=state_errors,
+            occupancy=shared_page_occupancy,
+            num_compressed_pages=int(compressed_k_cache.shape[0]),
+            caps=caps,
+            _prepared=None if programs is None else programs.support,
+        )
+    launch_validate_completed_groups(
+        query_positions=query_positions,
+        rope_positions=rope_positions,
+        request_ids=request_ids,
+        query_start_loc=query_start_loc,
+        raw_state_slot_ids=raw_state_slot_ids,
+        raw_logical_positions=raw_logical_positions,
+        raw_rope_positions=raw_rope_positions,
+        state_errors=state_errors,
+        rope_position_rows=int(rope_cos.shape[0]),
+        caps=caps,
+        _prepared=None if programs is None else programs.support,
+    )
+    launch_propagate_request_errors(
+        request_ids=request_ids,
+        request_errors=request_errors,
+        state_errors=state_errors,
+        caps=caps,
+        _prepared=None if programs is None else programs.support,
+    )
     # Completion consumes the old ring before the current suffix can wrap it.
     launch_compress_completed_groups(
         raw_index_key=raw_index_key,
-        _prepared=None if programs is None else programs.support,
         query_positions=query_positions,
         rope_positions=rope_positions,
         request_ids=request_ids,
@@ -2324,7 +2470,9 @@ def _qsa_decode_impl(
         rope_sin=rope_sin,
         compressed_cache=compressed_k_cache,
         compressed_block_table=compressed_block_table,
+        state_errors=state_errors,
         caps=caps,
+        _prepared=None if programs is None else programs.support,
     )
     launch_commit_raw_ring(
         raw_index_key=raw_index_key,
@@ -2333,14 +2481,15 @@ def _qsa_decode_impl(
         request_ids=request_ids,
         query_start_loc=query_start_loc,
         sequence_lengths=sequence_lengths,
-        _prepared=None if programs is None else programs.support,
         is_prefilling=is_prefilling,
         raw_state_slot_ids=raw_state_slot_ids,
         raw_k_ring=raw_k_ring,
         raw_logical_positions=raw_logical_positions,
         raw_rope_positions=raw_rope_positions,
         raw_interval_start_positions=raw_interval_start_positions,
+        state_errors=state_errors,
         caps=caps,
+        _prepared=None if programs is None else programs.support,
     )
 
     from ._sparse_gqa import launch_sparse_paged_gqa
@@ -2351,6 +2500,7 @@ def _qsa_decode_impl(
         chunk_request_ids = request_ids[row_slice]
         chunk_positions = query_positions[row_slice]
         chunk_rope = rope_positions[row_slice]
+        chunk_errors = state_errors[row_slice]
         chunk_prepared = prepared_query[:chunk_rows]
         chunk_scores = scores[:chunk_rows]
         chunk_eligible = eligible_counts[:chunk_rows]
@@ -2373,6 +2523,7 @@ def _qsa_decode_impl(
             rope_positions=chunk_rope,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
+            state_errors=chunk_errors,
             prepared_query=chunk_prepared,
             caps=caps,
             _prepared=None if programs is None else programs.support,
@@ -2405,6 +2556,7 @@ def _qsa_decode_impl(
                 sequence_lengths=sequence_lengths,
                 compressed_cache=compressed_k_cache,
                 compressed_block_table=compressed_block_table,
+                state_errors=chunk_errors,
                 scores=chunk_scores,
                 eligible_counts=chunk_eligible,
                 merge_lengths=chunk_merge_lengths,
@@ -2446,13 +2598,14 @@ def _qsa_decode_impl(
             topk_group_ids=final_ids,
             eligible_counts=chunk_eligible,
             query_positions=chunk_positions,
+            state_errors=chunk_errors,
             selected_positions=selected,
             caps=caps,
             _prepared=None if programs is None else programs.support,
         )
 
-        # Selection has no dependency on main Q/K/V contents. Its selected
-        # positions remain live until the attention stage consumes them.
+        # Selection has no dependency on main Q/K/V contents. Its output and
+        # error mask remain live until the attention stage consumes them.
         if query is None:
             continue
 
@@ -2486,6 +2639,7 @@ def _qsa_decode_impl(
             direct_kv_warps=int(sparse_gqa_direct_kv_warps),
             _prepared=None if programs is None else programs.sparse,
         )
+        launch_poison_failed_rows(output=active_output, state_errors=chunk_errors, _prepared=None if programs is None else programs.support)
 
 
 _QSA_MUTATED_ARGUMENTS = (
@@ -3485,6 +3639,7 @@ def run(
             [query, request_ids, query_positions, reuse.source_rows],
         )
         prepare_selection(
+            binding.plan.handle,
             state._storage,
             state.plan.max_source_rows,
             state.plan.selection_width,
@@ -3493,6 +3648,7 @@ def run(
             query_positions,
             binding.scratch,
             binding.state._layout.draft_positions_offset_bytes,
+            0,
             caps.max_batch,
             caps.max_speculative_tokens,
         )
@@ -3576,7 +3732,10 @@ def _record_draft_anchors(binding: Binding, positions: torch.Tensor) -> None:
 
         state = binding.draft_selection
         record_anchors(
+            binding.plan.handle,
             positions,
+            binding.scratch,
+            0,
             binding.selected_positions,
             state._storage,
             state.plan.max_source_rows,
@@ -3611,6 +3770,7 @@ def _qsa_attention_op(
     state = require_prepared(plan_from_handle(plan_handle), "attention.qsa", query.device)
     if not isinstance(state, _MaterializedPlan) or not isinstance(state.programs, QsaPrograms):
         raise RuntimeError("QSA attention custom op requires a retained native plan")
+    from ._kernels import launch_poison_failed_rows
     from ._sparse_gqa import launch_sparse_paged_gqa
     from ._sparse_gqa_cute_config import BLOCK_N
 
@@ -3629,6 +3789,7 @@ def _qsa_attention_op(
         ),
     )
     rows, q_heads, head_dim = map(int, query.shape)
+    errors = _scratch_view(scratch, offset_bytes=0, shape=(state.caps.max_q_rows,), dtype=torch.int32)
     if selected_positions is None:
         selected_positions = _scratch_view(
             scratch,
@@ -3679,6 +3840,10 @@ def _qsa_attention_op(
             splits=splits,
             direct_kv_warps=direct_kv_warps,
             _prepared=state.programs.sparse,
+        )
+        launch_poison_failed_rows(
+            output=output[row_slice], state_errors=errors[row_slice],
+            _prepared=state.programs.support,
         )
 
 

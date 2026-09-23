@@ -826,6 +826,12 @@ class PreparationJob:
         obligation.key = self._choice_key(obligation, selections)
         if obligation.key is None:
             return
+        # Local hits cannot remove one participant from a shared tuning race.
+        # Compiled programs remain reusable; only distributed selection is rerun.
+        if (self.autotune and not self.session.cache_only
+                and not self.session._stop.is_set()
+                and len(self.session._tuning_ranks) > 1):
+            return
         with self._timing.span("cache_lookup"):
             cache = self.session._selection_cache()
             record = cache.get(obligation.key)

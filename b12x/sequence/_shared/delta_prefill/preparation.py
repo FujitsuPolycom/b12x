@@ -32,6 +32,8 @@ def _modules(component):
 
 def _caps_from_query(impl, query, ordinal, *, is_gdn):
     geometry = {"key_heads": query.key_heads, "value_heads": query.value_heads} if is_gdn else {"heads": query.heads}
+    if not is_gdn:
+        geometry.update(max_checkpoints=query.max_checkpoints, metadata_validation=query.metadata_validation)
     return impl.Caps(
         device=torch.device("cuda", ordinal), max_tokens=query.max_tokens,
         max_seqs=query.max_seqs, max_state_slots=query.max_state_slots,
@@ -50,7 +52,7 @@ def _metadata_binding(layout, query):
         return SimpleNamespace(dtype=dtype, device=device)
 
     integers = (
-        "band_base", "sorted_seq", "rank_of", "pos_seq", "pos_local", "window_table",
+        "error_code", "duplicate_slots", "band_base", "sorted_seq", "rank_of", "pos_seq", "pos_local", "window_table",
         "ready_flags", "cu_seqlens", "checkpoint_offsets", "num_seqs", "num_tokens",
     )
     fields = {name: tensor(torch.int32) for name in integers}

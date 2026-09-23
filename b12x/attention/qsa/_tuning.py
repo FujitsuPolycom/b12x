@@ -269,7 +269,7 @@ TUNING = TuningContract(
             binding=ParameterBinding.COMPILE,
         ),
     ),
-    candidate_contract_version=3,
+    candidate_contract_version=4,
 )
 
 

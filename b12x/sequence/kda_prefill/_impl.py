@@ -33,7 +33,9 @@ class Caps:
     state_dtype: torch.dtype = torch.float32
     qk_l2norm: bool = True
     checkpoint_export: bool = False
+    max_checkpoints: int = 1
     null_state_index: int | None = None
+    metadata_validation: str = "transactional"
     chunk_tokens: int = 16
 
     def __post_init__(self) -> None:
@@ -56,6 +58,12 @@ class Caps:
             raise ValueError(f"chunk_tokens must be {CHUNK_TOKENS}")
         object.__setattr__(self, "qk_l2norm", bool(self.qk_l2norm))
         object.__setattr__(self, "checkpoint_export", bool(self.checkpoint_export))
+        if type(self.max_checkpoints) is not int or self.max_checkpoints not in (1, 2, 4):
+            raise ValueError("max_checkpoints must be 1, 2 or 4")
+        if self.metadata_validation not in ("transactional", "trusted"):
+            raise ValueError("metadata_validation must be transactional or trusted")
+        if self.max_checkpoints > 1 and (not self.checkpoint_export or self.metadata_validation != "transactional"):
+            raise ValueError("multiple checkpoints require checkpoint_export and transactional validation")
         if self.null_state_index is not None:
             null = int(self.null_state_index)
             if null < 0 or null >= self.max_state_slots:
@@ -110,6 +118,8 @@ def _query(caps: Caps, invocation: FrozenMapping) -> KdaPrefillQuery:
         state_dtype=str(caps.state_dtype).removeprefix("torch."),
         qk_l2norm=caps.qk_l2norm,
         checkpoint_export=caps.checkpoint_export,
+        max_checkpoints=caps.max_checkpoints,
+        metadata_validation=caps.metadata_validation,
         max_tokens=caps.max_tokens,
         max_seqs=caps.max_seqs,
         max_state_slots=caps.max_state_slots, null_state_index=caps.null_state_index,
@@ -207,8 +217,9 @@ def run(
 
     A sequence whose tiles span more than one pipeline window keeps its
     running state in its final state slot between windows, so such a
-    sequence must have a non-null final slot. Packed metadata is not checked
-    on the device; the caller supplies in-range, conflict-free slots.
+    sequence must have a non-null final slot. Transactional validation checks
+    packed bounds and slot conflicts before any recurrent-state mutation; an
+    invalid invocation poisons output and leaves state unchanged.
     """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be kda_prefill.Binding")

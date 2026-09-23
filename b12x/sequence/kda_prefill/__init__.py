@@ -11,7 +11,7 @@ The recurrent-state pool uses the ``gdn_decode`` physical layout
 ``[slot, head, value_dim, key_dim]`` in fp32, so a prefill and a decode of the
 same request share one pool without conversion. State slots are addressed by
 index rather than gathered: a request names its initial slot, its final slot,
-and optionally one checkpoint slot with a chunk-aligned token offset, and the
+and optionally one, two, or four checkpoint slots with chunk-aligned offsets. The
 op reads and writes those slots directly. ``Caps.null_state_index`` may reserve
 one index meaning "zero initial state" and "do not write".
 
@@ -25,9 +25,10 @@ Declare geometry and parameter dtypes with ``plan(Caps(...), invocation=...)``;
 ``invocation_from_tensors`` supplies the immutable dtype coordinates.
 ``PreparationSession`` selects and primes the plan before ``bind`` may
 consume it. Runtime launches use caller-owned scratch, allocate no tensor
-storage, and are capture safe. Packed metadata is not checked on the device:
-the caller supplies in-range slots, one writer per slot, and chunk-aligned
-checkpoint offsets.
+storage, and are capture safe. Transactional validation checks packed bounds,
+slot ownership, and checkpoint offsets before mutation. Invalid metadata leaves
+the recurrent state unchanged and poisons output; ``Binding.error_code`` reports
+the failed conditions. Multiple checkpoints require transactional validation.
 """
 
 from __future__ import annotations

@@ -1,5 +1,7 @@
 """Representative activation-producing races owned by preparation."""
 from __future__ import annotations
+import gc
+import threading
 
 import ctypes
 import math
@@ -77,6 +79,31 @@ def no_compilation():
         observed.check()
 
 
+# Automatic collection may unload a CUDA library and wait for queued work.
+# Every gate must release its device wait before the last holder restores GC.
+_gc_deferral_lock = threading.RLock()
+_gc_deferral_count = 0
+_gc_deferral_restore = False
+
+
+@contextmanager
+def _defer_automatic_gc():
+    """Suspend automatic cyclic GC, not explicit collection or refcount finalizers."""
+    global _gc_deferral_count, _gc_deferral_restore
+    with _gc_deferral_lock:
+        if _gc_deferral_count == 0:
+            _gc_deferral_restore = gc.isenabled()
+            gc.disable()
+        _gc_deferral_count += 1
+    try:
+        yield
+    finally:
+        with _gc_deferral_lock:
+            _gc_deferral_count -= 1
+            if _gc_deferral_count == 0 and _gc_deferral_restore:
+                gc.enable()
+
+
 class _StreamGate:
     """Hold queued device work until the host finishes submitting a sample."""
 
@@ -105,18 +132,19 @@ class _StreamGate:
 
     @contextmanager
     def hold(self, stream):
-        self.streams[stream.cuda_stream] = stream
-        self.sequence = (self.sequence + 1) & 0xFFFFFFFF
-        target = self.sequence
-        self._check(self.driver.cuStreamWaitValue32(
-            stream.cuda_stream, self.device_pointer, target,
-            int(self.driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ),
-        ))
-        try:
-            yield
-        finally:
-            # A later release must also satisfy an earlier, still queued wait.
-            self.flag.value = target
+        with _defer_automatic_gc():
+            self.streams[stream.cuda_stream] = stream
+            self.sequence = (self.sequence + 1) & 0xFFFFFFFF
+            target = self.sequence
+            try:
+                self._check(self.driver.cuStreamWaitValue32(
+                    stream.cuda_stream, self.device_pointer, target,
+                    int(self.driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ),
+                ))
+                yield
+            finally:
+                # Release queued work before automatic finalizers may resume.
+                self.flag.value = target
 
     def close(self):
         if self.pointer is None:
