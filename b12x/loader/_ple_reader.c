@@ -204,8 +204,10 @@ static PyObject *py_ple_reader_add(PyObject *self, PyObject *args) {
     Py_BEGIN_ALLOW_THREADS
     pthread_mutex_lock(&reader->api_mutex);
     reader->plan.failure.message[0] = 0;
+    const char *buffered_io = getenv("B12X_DISK_TABLE_BUFFERED_IO");
+    bool buffered = buffered_io && strcmp(buffered_io, "1") == 0;
     error = ple_add_source(&reader->plan, shard, path, offset, scale != 0,
-                           ple_register_files, reader);
+                           buffered, ple_register_files, reader);
     failure = reader->plan.failure;
     pthread_mutex_unlock(&reader->api_mutex);
     Py_END_ALLOW_THREADS

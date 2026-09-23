@@ -239,7 +239,7 @@ static PyObject *add(PyObject *self, PyObject *args) {
     Py_BEGIN_ALLOW_THREADS
     pthread_mutex_lock(&r->mutex);
     r->plan.failure.message[0] = 0;
-    error = ple_add_source(&r->plan, shard, path, offset, scale != 0, register_files, r);
+    error = ple_add_source(&r->plan, shard, path, offset, scale != 0, false, register_files, r);
     failure = r->plan.failure;
     pthread_mutex_unlock(&r->mutex);
     Py_END_ALLOW_THREADS

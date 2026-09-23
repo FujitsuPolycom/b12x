@@ -90,7 +90,7 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
 }
 
 static inline int ple_add_source(ple_plan_t *reader, int64_t shard, const char *path,
-        int64_t offset, bool scale, int (*register_files)(ple_plan_t *, void *), void *owner) {
+        int64_t offset, bool scale, bool buffered, int (*register_files)(ple_plan_t *, void *), void *owner) {
     if (shard < 0 || shard > (reader->padded_rows - 1) / reader->shard_rows || offset < 0 ||
         (scale && !reader->scale_bytes)) return EINVAL;
     int64_t first = shard * reader->shard_rows;
@@ -106,7 +106,9 @@ static inline int ple_add_source(ple_plan_t *reader, int64_t shard, const char *
         snprintf(failure.message, sizeof(failure.message), "PLE source shard/plane is already registered");
     } else {
         /* Reject FIFOs via fstat without blocking waiting for a writer. */
-        int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_DIRECT);
+        int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
+        if (!buffered) flags |= O_DIRECT;
+        int fd = open(path, flags);
         struct stat status;
         if (fd < 0) system_error(&failure, "open PLE source");
         else if (fstat(fd, &status) != 0) system_error(&failure, "fstat PLE source");
