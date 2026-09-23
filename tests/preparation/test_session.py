@@ -534,15 +534,18 @@ def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
 
     results = [job.result() for job in jobs]
     try:
-        assert [result.benchmarked_candidates for result in results] == ([2, 2] if cached_ranks else [4, 4])
+        # SparkRing reraces distributed selections even after cache agreement.
+        assert [result.benchmarked_candidates for result in results] == [4, 4]
         assert [result.selections["shared"].config.width for result in results] == [2, 2]
-        assert [result.selections["shared"].source for result in results] == (["cached"] * 2 if cached_ranks else ["tuned"] * 2)
+        assert [result.selections["shared"].source for result in results] == ["tuned"] * 2
         assert all(result.selections["fresh"].source == "tuned" for result in results)
         assert [result.coverage["shared"]["measured_count"] for result in results] == [4, 4]
         assert [req[0].plan.selection.config.width for req in requests] == [2, 2]
         # Saving the fresh choice must not restore a conflicting local winner.
         for engine in engines:
+            engine.cache_only = True
             result = engine.prepare((request(name="again", tuning=tuning),))
+            assert result.selections["again"].source == "cached"
             assert result.selections["again"].config.width == 2
     finally:
         for engine in engines:
