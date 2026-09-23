@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
@@ -410,6 +411,7 @@ def _glm_requests(meta, device, rows):
                     "output_scores": None,
                 })
             name = f"attention.glm_indexer.m{m}.r{start}_{end}"
+            declaration = dsa_indexer.plan(caps, invocation=invocation)
             index_names.append(name)
 
             def index_call(state, *, start=start, end=end, n=n, mode=mode):

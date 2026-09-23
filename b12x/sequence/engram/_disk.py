@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import operator
 import os
+from typing import TYPE_CHECKING
 import torch
+
+if TYPE_CHECKING:
+    from ._impl import LookupBinding, _State
 
 def _require_disk_eager(device: torch.device) -> None:
     if torch.compiler.is_compiling():

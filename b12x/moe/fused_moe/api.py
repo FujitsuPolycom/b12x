@@ -26,6 +26,7 @@ from ._preparation import (
     RouteTopKInvocation,
     plan_fc2 as _plan_fc2,
     plan_route_topk as _plan_route_topk,
+    variant_for,
 )
 from .execution import ExecutionCapacity, RoutingSpec, plan_execution as _plan_execution
 from .planning import (

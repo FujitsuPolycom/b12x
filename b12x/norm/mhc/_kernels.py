@@ -2617,7 +2617,7 @@ class MHCPrefillTf32ProjectTmaKernel:
             self.tile_n = _PREFILL_TF32_TMA_LONG_4096_TILE_N
             self.tile_k = _PREFILL_TF32_TMA_LONG_4096_TILE_K
             self.num_stages = _PREFILL_TF32_TMA_LONG_4096_STAGES
-            self.k_splits = _PREFILL_TF32_TMA_LONG_4096_K_SPLITS
+            self.k_splits = 4
         elif use_4096_chunk_geometry:
             self.num_m_warps = _PREFILL_TF32_TMA_CHUNK_4096_M_WARPS
             self.num_n_warps = _PREFILL_TF32_TMA_CHUNK_4096_N_WARPS
@@ -2625,7 +2625,7 @@ class MHCPrefillTf32ProjectTmaKernel:
             self.tile_n = _PREFILL_TF32_TMA_CHUNK_4096_TILE_N
             self.tile_k = _PREFILL_TF32_TMA_CHUNK_4096_TILE_K
             self.num_stages = _PREFILL_TF32_TMA_CHUNK_4096_STAGES
-            self.k_splits = _PREFILL_TF32_TMA_CHUNK_4096_K_SPLITS
+            self.k_splits = 8
         elif chunk_geometry:
             self.num_m_warps = _PREFILL_TF32_TMA_CHUNK_OTHER_M_WARPS
             self.num_n_warps = _PREFILL_TF32_TMA_CHUNK_OTHER_N_WARPS

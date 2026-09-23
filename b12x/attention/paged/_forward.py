@@ -212,7 +212,7 @@ def _encode_plane_tma_descriptors(
             f"tile_rows={tile_rows} must be positive and divide page_size={page_size}"
         )
 
-    swizzle_name = os.environ.get("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "")
+    swizzle_name = paged_control("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "")
     swizzle = (
         cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE
         if swizzle_name == "none"
