@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import os
-from b12x._lib.quant.block_codec import BLOCK_CODECS
-
 from dataclasses import dataclass
 
 import torch
 
 from b12x._lib.env import env_flag
+from b12x._lib.quant.block_codec import BLOCK_CODECS
 from b12x.moe._shared.kernels.activations import (
     SUPPORTED_MOE_ACTIVATIONS,
     is_gated_moe_activation,

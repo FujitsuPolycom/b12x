@@ -60,6 +60,50 @@ def test_uniform_nvfp4_a16_requires_only_mma_packing():
         ))
 
 
+@pytest.mark.parametrize("mode,larger_recipe", (("a4", "nvfp4"), ("a8", "w4a8_nvfp4"), ("auto", "nvfp4_auto")))
+def test_a16_cutoff_uses_existing_precision_candidates(mode, larger_recipe):
+    from types import SimpleNamespace
+    from b12x.moe.fused_moe._impl import B12XFP4ExpertWeights, _PreparedWeightRepresentation
+    from b12x.preparation import DeviceIdentity
+
+    base = weight_plan()
+    plan = weight_plan(
+        activation=replace(base.activation, mode=mode, a16_max_tokens=32),
+        source=replace(base.source, w13_layout="w13" if mode == "auto" else "w31"),
+    )
+    assert plan._impl.w13_layout == "w13"
+    assert plan._impl.quant_modes == {"w4a16", "nvfp4" if mode == "auto" else larger_recipe}
+    w1 = torch.empty((8, 256, 64), dtype=torch.uint8)
+    w2 = torch.empty((8, 128, 64), dtype=torch.uint8)
+    experts = fused_moe.PreparedExperts(plan=plan, _impl=B12XFP4ExpertWeights(
+        plan=plan._impl,
+        w1_fp4=w1, w2_fp4=w2,
+        w1_blockscale=torch.empty((8, 256, 8), dtype=torch.uint8),
+        w2_blockscale=torch.empty((8, 128, 8), dtype=torch.uint8),
+        w1_alphas=torch.ones(8), w2_alphas=torch.ones(8),
+        a1_gscale=torch.ones(8), a2_gscale=torch.ones(8),
+        representation=_PreparedWeightRepresentation(
+            quant_mode="w4a16", layout="source_native",
+            value=SimpleNamespace(w13=w1, w2=w2),
+        ),
+    ))
+    declaration = fused_moe.plan_execution(
+        experts=experts, capacity=fused_moe.ExecutionCapacity(
+            max_tokens=128, top_k=2, warmup_token_counts=(4, 33),
+        ),
+    )
+    assert declaration.token_counts == (4, 32, 33, 128)
+    device = DeviceIdentity("nvidia", (12, 0), 188, "SM120")
+    for rows, child in declaration.variants.items():
+        assert child.query.quant_mode == ("w4a16" if rows <= 32 else larger_recipe)
+        configs = [config for _, config in child.contract.eligible_plan(child.query, device).candidates]
+        assert configs
+        if rows <= 32:
+            assert all(config.backend == "w4a16" for config in configs)
+        elif mode != "auto":
+            assert all(config.backend != "w4a16" for config in configs)
+
+
 @pytest.mark.parametrize("name", ["w13_blockscale", "w2_blockscale"])
 @pytest.mark.parametrize("invalid", ["truncated", "strided", "dtype"])
 def test_native_nvfp4_preparation_validates_scale_storage(name, invalid):
@@ -110,8 +154,9 @@ def test_uniform_nvfp4_a16_does_not_retain_source_scales():
 @pytest.mark.parametrize("num_experts,hidden_size,intermediate_size,topk", (
     (8, 256, 256, 2), (256, 6144, 256, 8),
 ))
+@pytest.mark.parametrize("counts", ((1, 2, 4, 7, 8), (1, 2, 3, 4, 5, 6, 8)))
 def test_auto_native_decode_retains_launches_and_replays_shared_storage(
-    tmp_path, monkeypatch, num_experts, hidden_size, intermediate_size, topk,
+    tmp_path, monkeypatch, num_experts, hidden_size, intermediate_size, topk, counts,
 ):
     from b12x.preparation import PreparationSession, PreparedCall
     from b12x.moe._shared.kernels.w4a16 import kernel
@@ -145,7 +190,6 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
     ):
         assert tensor.data_ptr() == original.data_ptr()
     originals = [tensor.clone() for tensor in raw]
-    counts = (1, 2, 4, 7, 8)
     x = torch.randn(8, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.25
     ids = torch.stack([torch.randperm(num_experts, device="cuda")[:topk] for _ in range(8)])
     probabilities = torch.softmax(torch.randn(8, topk, device="cuda"), dim=-1)
@@ -171,7 +215,8 @@ def test_auto_native_decode_retains_launches_and_replays_shared_storage(
             name="native-auto", prepare_calls={m: make_call(m) for m in counts},
         ),))
         bindings = []
-        for m in (*counts, 3):
+        unprepared_rows = next(rows for rows in range(1, 8) if rows not in counts)
+        for m in (*counts, unprepared_rows):
             state = execution.variants[m if m in counts else 8].prepared.state
             scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
                             for spec in state.scratch.scratch_specs())

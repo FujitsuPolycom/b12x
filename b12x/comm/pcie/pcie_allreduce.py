@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # this shared policy instead of duplicating an implementation-specific limit.
 ISLAND_RS_MAX_BYTES = 160 * 1024
 # Partial islands use the leader path without the equal-quarter alternative.
-# Keep default dispatch below its measured NCCL crossover for decode vectors.
+# Limit default dispatch to decode vectors of at most 32 KiB.
 PARTIAL_ISLAND_MAX_BYTES = 32 * 1024
 
 

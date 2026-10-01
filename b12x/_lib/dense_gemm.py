@@ -9346,6 +9346,7 @@ def _lower_dense_gemm(
     )
 
 
+@program_cache(scope="preparation")
 def _compile_dense_lowering(payload, device_ordinal):
     """Compile exact production launchers from metadata, without tensor storage."""
     p = _DenseLowering.from_dict(payload)
@@ -9634,6 +9635,7 @@ def _lower_dense_gemm_fused_quant_a(
     )
 
 
+@program_cache(scope="preparation")
 def _compile_dense_fused_quant_lowering(payload, device_ordinal):
     p = _DenseFusedQuantLowering.from_dict(payload)
     one_m = (p.expected_m if p.expected_m is not None else p.m) == 1

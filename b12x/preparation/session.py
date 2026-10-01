@@ -7,6 +7,7 @@ later batch so each candidate is compared head to head with it.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import os
@@ -21,6 +22,7 @@ from b12x._lib.compile_plan import (
     compiled_program_available, observe_programs, retain_compiled_programs,
 )
 from b12x._lib.compile_pool import CompilePool, describe_compilation, compile_in_process
+from b12x._lib.program_cache import PreparationProgramCache, evict_unretained
 from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolution_guard
 from ._cache import SelectionCache, cache_identity, digest
 from ._measurement import DEFAULT_SAMPLES, SURVIVOR_ROUNDS
@@ -34,6 +36,16 @@ from .types import (
 )
 
 logger = logging.getLogger("b12x.preparation")
+
+
+class _CandidateLaunchRejected(Exception):
+    """A trial could not launch, but its resources were safely released."""
+
+
+def _cooperative_launch_rejected(error):
+    from cutlass.base_dsl.common import DSLCudaRuntimeError
+
+    return isinstance(error, DSLCudaRuntimeError) and error.error_code == 720
 
 
 @dataclass
@@ -256,6 +268,16 @@ def _plans_of(request):
     return (plan,)
 
 
+def _default_compile_workers(device):
+    identity = device.identity
+    spark = (
+        identity is not None
+        and identity.vendor == "nvidia"
+        and identity.product_name in {"gb10", "nvidia gb10"}
+    )
+    return int(os.environ.get("B12X_COMPILE_WORKERS", "4" if spark else "8"))
+
+
 class PreparationSession:
     def __init__(
         self, *, device=None, autotune=True, cache_dir=None, namespace=None,
@@ -263,8 +285,9 @@ class PreparationSession:
         race_batch=32, race_budget=None, collective_barrier=None,
     ):
         """Initialize planning resources and an optional collective entry barrier."""
+        self.device = device if isinstance(device, DetectedDevice) else detect_device(device)
         if compile_workers is None:
-            compile_workers = int(os.environ.get("B12X_COMPILE_WORKERS", "8"))
+            compile_workers = _default_compile_workers(self.device)
         for name, value in (
             ("compile_workers", compile_workers), ("rounds", rounds), ("samples", samples),
             ("race_batch", race_batch),
@@ -276,7 +299,6 @@ class PreparationSession:
             raise ValueError("race_budget must be a positive byte count or None")
         if type(autotune) is not bool or type(cache_only) is not bool:
             raise TypeError("autotune and cache_only must be boolean")
-        self.device = device if isinstance(device, DetectedDevice) else detect_device(device)
         self.autotune, self.cache_only = autotune, cache_only
         self.compile_workers, self.rounds, self.samples = compile_workers, rounds, samples
         self.race_batch, self.race_budget = race_batch, race_budget
@@ -307,7 +329,7 @@ class PreparationSession:
         if self._job is not None or self._pool is not None:
             raise RuntimeError("compiler concurrency can only change between jobs")
         if workers is None:
-            workers = int(os.environ.get("B12X_COMPILE_WORKERS", "8"))
+            workers = _default_compile_workers(self.device)
         if type(workers) is not int or workers < 0:
             raise ValueError("compile_workers must be an integer of at least 0")
         self.compile_workers = workers
@@ -542,18 +564,42 @@ class PreparationSession:
 
     def release(self, plan):
         """Drop a plan's prepared state; destroy graphs that replay it first."""
+        self.release_many((plan,))
+
+    def release_many(self, plans) -> None:
+        """Release a batch after graph teardown, then reclaim unused programs once."""
         self._check_thread()
         if self._job is not None:
             raise RuntimeError("cannot release resources during preparation")
-        prepared = plan._prepared
-        if prepared is None:
+        pending = {}
+
+        def collect(plan):
+            if plan in pending:
+                return
+            pending[plan] = plan._prepared
+            if isinstance(plan, _CompositePlan):
+                for child in plan.variants.values():
+                    collect(child)
+
+        for plan in plans:
+            collect(plan)
+        closers = [lambda plan=plan, prepared=prepared: self._release_payload(plan, prepared)
+                   for plan, prepared in pending.items() if prepared is not None]
+        if not closers:
             return
-        if isinstance(plan, _CompositePlan):
-            self._release_payload(plan, prepared)
-            for child in plan.variants.values():
-                self.release(child)
-        else:
-            self._release_payload(plan, prepared)
+        try:
+            _close_all((self._synchronize, *closers))
+        finally:
+            _close_all((self._reclaim_programs,))
+
+    def _reclaim_programs(self):
+        timing = PreparationTiming("cleanup", rank=self._tuning_rank)
+        keep = frozenset(program for plan in self._plans if plan.prepared is not None
+                         for program in plan.prepared.programs)
+        with timing.span("program_reclamation"):
+            removed = evict_unretained(keep)
+            gc.collect()
+        timing.record("complete", evicted_entries=removed)
 
     @contextmanager
     def capture(self):
@@ -579,6 +625,7 @@ class PreparationSession:
         if self.state == "CLOSED":
             return
         self._check_thread()
+        synchronize = bool(self._plans) or self._job is not None
         closers = []
         if self._job is not None:
             closers.append(self._job.close)
@@ -594,9 +641,12 @@ class PreparationSession:
             guard, self._guard = self._guard, None
             closers.append(lambda: guard.__exit__(None, None, None))
         self.state = "CLOSED"
-        _close_all(closers)
-        self._plans.clear()
-        self._shared.clear()
+        try:
+            _close_all(((self._synchronize,) if synchronize else ()) + tuple(closers))
+        finally:
+            self._plans.clear()
+            self._shared.clear()
+            _close_all((self._reclaim_programs,))
 
     def __enter__(self):
         """Enter the session after validating the owning thread."""
@@ -634,6 +684,7 @@ class PreparationJob:
         self._plans_by_name = {}
         self._started = time.monotonic()
         self._timing = PreparationTiming("job", rank=session._tuning_rank)
+        self._program_cache = PreparationProgramCache(self._timing)
         self._last_advance_end = None
         self._phase = "planning"
         self._active_request = None
@@ -746,8 +797,11 @@ class PreparationJob:
         if self._last_advance_end is not None:
             self._timing.add("between_advances", started - self._last_advance_end)
         try:
-            return self._advance(collective_key=collective_key, tuning=tuning, cache=cache)
+            with self._program_cache.activate():
+                return self._advance(collective_key=collective_key, tuning=tuning, cache=cache)
         finally:
+            if self._result is not None or self._closed:
+                self._program_cache.clear()
             self._timing.add("advance", time.perf_counter() - started)
             self._timing.record(
                 "complete" if self._result is not None else "progress",
@@ -901,7 +955,12 @@ class PreparationJob:
             pool.cancel_optional()
             closers.append(lambda: pool.close(terminate=self._error is not None))
         self.session._job = None
-        _close_all(closers)
+        try:
+            _close_all(closers)
+        finally:
+            self._program_cache.clear()
+            if self._result is None:
+                _close_all((self.session._reclaim_programs,))
 
     def _choice_key(self, obligation, selections):
         request, configuration = obligation.request, obligation.configuration
@@ -940,11 +999,14 @@ class PreparationJob:
         obligation.key = self._choice_key(obligation, selections)
         if obligation.key is None:
             return
-        # Local hits cannot remove one participant from a shared tuning race.
-        # Compiled programs remain reusable; only distributed selection is rerun.
+        # Before the ranks reconcile their selection caches, a local hit could
+        # remove one participant from a shared tuning race. After
+        # reconciliation every rank reads the same agreed records and makes the
+        # same decision, so a cached selection is used on every rank or none.
         if (self.autotune and not self.session.cache_only
                 and not self.session._stop.is_set()
-                and len(self.session._tuning_ranks) > 1):
+                and len(self.session._tuning_ranks) > 1
+                and not self.session._tuning_cache_synchronized):
             return
         with self._timing.span("cache_lookup"):
             cache = self.session._selection_cache()
@@ -1168,7 +1230,7 @@ class PreparationJob:
             # Surface a factory failure even if another job published shared code.
             self.session._pool.pending
 
-    def _instantiate(self, request, selection, factory, expected, *, synchronize=True, compile_directly=False):
+    def _instantiate(self, request, selection, factory, expected, *, synchronize=True, compile_directly=False, reject_unlaunchable=False):
         import torch
 
         from ._measurement import no_compilation
@@ -1178,13 +1240,33 @@ class PreparationJob:
             # remain mutable during later serving warmup and graph replay.
             try:
                 with torch.inference_mode(False), torch.no_grad():
-                    state = request.plan._materialize(selection, self.session.device)
-                    call = factory(state)
+                    with self._timing.span("materialize"):
+                        state = request.plan._materialize(selection, self.session.device)
+                    with self._timing.span("bind"):
+                        call = factory(state)
                     guard = _CallGuard(call)
                     self._temporaries.append(guard.finish)
-                _prime(call)
+                rejected = None
+                try:
+                    with self._timing.span("prime"):
+                        _prime(call)
+                except Exception as error:
+                    if not reject_unlaunchable or not _cooperative_launch_rejected(error):
+                        raise
+                    rejected = error
+                if rejected is not None:
+                    # Drain preceding launches before restoring scratch. Cleanup
+                    # runs outside the handler so its failures remain fatal.
+                    self.session._synchronize()
+                    guard.finish()
+                    self._temporaries.remove(guard.finish)
+                    raise _CandidateLaunchRejected(
+                        "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)"
+                    ) from rejected
                 if synchronize:
                     self.session._synchronize()
+            except _CandidateLaunchRejected:
+                raise
             except Exception as error:
                 message = (
                     f"{request.name} failed to prepare with configuration "
@@ -1201,7 +1283,7 @@ class PreparationJob:
             raise RuntimeError(f"preparation used undeclared programs for {request.name}")
         return state, call, guard, retained
 
-    def _call(self, obligation, selection, factory, *, request=None, synchronize=True):
+    def _call(self, obligation, selection, factory, *, request=None, synchronize=True, reject_unlaunchable=False):
         request = obligation.request if request is None else request
         plan = request.plan
         expected = obligation.programs[plan.contract.config_payload(selection.config)]
@@ -1210,7 +1292,10 @@ class PreparationJob:
             for program in self._dependency_programs[name]
         )
         with self._timing.span("materialize_prime"):
-            return self._instantiate(request, selection, factory, expected, synchronize=synchronize)
+            return self._instantiate(
+                request, selection, factory, expected, synchronize=synchronize,
+                reject_unlaunchable=reject_unlaunchable,
+            )
 
     def _trial(self, obligation, index, assignment, config):
         if self.session._stop.is_set():
@@ -1226,7 +1311,10 @@ class PreparationJob:
         selection = self._selection(obligation, config, "tuned", assignment)
         with self._timing.span("memory_accounting"):
             before = self.session._allocated()
-        state, call, guard, retained = self._call(obligation, selection, request.benchmark_call, synchronize=False)
+        state, call, guard, retained = self._call(
+            obligation, selection, request.benchmark_call, synchronize=False,
+            reject_unlaunchable=True,
+        )
         with self._timing.span("memory_accounting"):
             resident = max(0, self.session._allocated() - before)
         self._candidates_prepared += 1
@@ -1332,6 +1420,7 @@ class PreparationJob:
         pending = list(local_candidates)
         champion = carried = None
         live = []
+        rejected_count = 0
         try:
             while pending or carried is not None:
                 if self.session._stop.is_set():
@@ -1348,7 +1437,19 @@ class PreparationJob:
                     carried = None
                 while pending and len(batch) < self.session.race_batch:
                     index, (assignment, config) = pending.pop(0)
-                    trial = yield from self._trial(obligation, index, assignment, config)
+                    try:
+                        trial = yield from self._trial(obligation, index, assignment, config)
+                    except _CandidateLaunchRejected as error:
+                        rejected_count += 1
+                        logger.warning(
+                            "Skipping %s candidate %d on rank %d: %r: %s",
+                            request.name, index, self.session._tuning_rank, config, error,
+                        )
+                        self._timing.record(
+                            "candidate_rejected", request=request.name,
+                            candidate_index=index, reason=str(error),
+                        )
+                        continue
                     if trial is None:
                         return None
                     live.append(trial)
@@ -1357,6 +1458,8 @@ class PreparationJob:
                     if budget is not None and resident > budget and len(batch) > 1:
                         carried = batch.pop()
                         break
+                if not batch:
+                    continue
                 trials = ([] if champion is None else [champion]) + batch
                 self._batch_candidates = len(trials)
                 self._timing.record(
@@ -1389,16 +1492,33 @@ class PreparationJob:
                     latencies_us=list(measurement.latencies_us),
                     winner=champion.index,
                 )
-            obligation.coverage["measured_count"] = len(local_candidates)
+            obligation.coverage["measured_count"] = len(local_candidates) - rejected_count
+            if champion is None:
+                if rank_count > 1:
+                    return TuningRequirement(
+                        obligation.key, self.session._tuning_ranks, None, None, None,
+                        rejected_count=rejected_count,
+                    )
+                raise RuntimeError(
+                    f"no launchable candidates for {request.name}: "
+                    f"all {rejected_count} candidates rejected with "
+                    "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)"
+                )
             assignment, config = champion.assignment, champion.config
             candidate_index, latency_us = champion.index, champion.latency_us
             if rank_count > 1:
                 return TuningRequirement(
                     obligation.key, self.session._tuning_ranks,
                     assignment, latency_us, candidate_index,
+                    rejected_count=rejected_count,
+                    cute_programs=tuple(
+                        program.key for program in obligation.programs[
+                            request.plan.contract.config_payload(config)
+                        ] if program.dialect == "cute"
+                    ),
                 )
             selection = self._selection(obligation, config, "tuned", assignment)
-            obligation.cache_pending = True
+            obligation.cache_pending = rejected_count == 0
             return selection
         finally:
             closers = [self.session._synchronize]
@@ -1555,8 +1675,8 @@ class PreparationJob:
                     configuration.query, configuration.device, winner.assignment,
                 )
                 obligation.selection = self._selection(obligation, config, "tuned", winner.assignment)
-                obligation.coverage["measured_count"] = len(obligation.candidates)
-                obligation.cache_pending = True
+                obligation.coverage["measured_count"] = len(obligation.candidates) - winner.rejected_count
+                obligation.cache_pending = winner.rejected_count == 0
             self._timing.record("request_resume", request=obligation.request.name)
             yield from self._install_obligation(obligation, selections)
         pending.clear()
@@ -1692,6 +1812,7 @@ class PreparationJob:
             for program in plan.prepared.programs
         )
         self.session._synchronize()
+        self._program_cache.clear()
         evict_unretained(keep)
         result = PreparationResult(
             plans=self._plans_by_name, coverage=self._coverage,

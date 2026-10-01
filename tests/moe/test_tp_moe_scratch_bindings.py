@@ -65,6 +65,20 @@ def _clear_moe_force_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.mark.parametrize("weight_layout", ["iq2_xs", "iq2_xxs", "q8_0", "trellis_t256"])
+def test_prefill_route_reduction_does_not_change_other_codec_epilogues(weight_layout):
+    from b12x.moe._shared.kernels.w4a16.host import prefill_fused_sum_eligible
+
+    assert not prefill_fused_sum_eligible(
+        dtype=torch.bfloat16,
+        m=4096,
+        full_rotation=False,
+        weight_layout=weight_layout,
+        collect_activation_amax=False,
+        enabled=True,
+    )
+
+
 def test_w4a16_prefill_reduction_freezes_caller_scratch_contract(monkeypatch):
     from b12x.moe.fused_moe._tuning import MoeDecodeConfig
 

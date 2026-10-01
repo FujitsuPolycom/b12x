@@ -10,6 +10,7 @@ from enum import Enum
 import torch
 
 from .._shared.execution import MoEWeightPreparationPlan
+from .._shared.kernels.activations import is_gated_moe_activation
 from ._impl import (
     plan_b12x_fp4_moe_weights,
     prepare_b12x_fp4_moe_weights,
@@ -17,9 +18,9 @@ from ._impl import (
     prepare_b12x_iq2_xs_weights,
 )
 from .config import TrellisConfig
-from .source import Exl3Source, PackedSource, WeightSource
+from .source import PackedSource, TrellisSource, WeightSource
+from .trellis_layout import TrellisStaging
 from .weights import (
-    Exl3Weights,
     PackedWeights,
     IQ2XSWeights,
     PreparedExperts,
@@ -42,7 +43,15 @@ class ActivationMode(str, Enum):
 
 @dataclass(frozen=True, kw_only=True)
 class ActivationSpec:
-    """Activation precision, nonlinearity, and public I/O dtype."""
+    """Activation precision, nonlinearity, and public I/O dtype.
+
+    ``rotation_dtype`` selects the internal full-rotation trellis arithmetic,
+    independently of BF16/FP16 public inputs. None retains the I/O dtype.
+    Only the FP16 full-rotation implementation is supported explicitly.
+
+    ``a16_max_tokens`` forces A16 up to an inclusive token capacity; zero
+    disables the constraint. Larger calls retain ``mode``.
+    """
 
     mode: ActivationMode
     nonlinearity: str
@@ -50,12 +59,18 @@ class ActivationSpec:
     swiglu_limit: float | None = None
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
+    rotation_dtype: torch.dtype | None = None
+    a16_max_tokens: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", ActivationMode(self.mode))
         object.__setattr__(self, "nonlinearity", str(self.nonlinearity).lower())
         if self.io_dtype not in {torch.bfloat16, torch.float16}:
             raise TypeError("io_dtype must be torch.bfloat16 or torch.float16")
+        if self.rotation_dtype not in (None, torch.float16):
+            raise TypeError("rotation_dtype must be torch.float16 or None")
+        if type(self.a16_max_tokens) is not int or self.a16_max_tokens < 0:
+            raise ValueError("a16_max_tokens must be a nonnegative integer")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -101,10 +116,13 @@ class WeightPlan:
 
 
 def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
+    """Map a packed source format and activation mode to its quant recipe."""
     source_format = source.format.value
     if mode is ActivationMode.A16:
-        if source_format == "mxfp6_e2m3":
-            raise ValueError("MXFP6 weights require A8 activations")
+        if source_format in ("mxfp6_e2m3", "mxfp8_e8m0_k32"):
+            raise ValueError(
+                f"{source_format} weights require A8 activations"
+            )
         return "w4a16"
     if mode is ActivationMode.A4:
         if source_format != "modelopt_nvfp4":
@@ -115,6 +133,7 @@ def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
             "fp4_e8m0_k32": "w4a8_mx",
             "modelopt_nvfp4": "w4a8_nvfp4",
             "mxfp6_e2m3": "w6a8_mx",
+            "mxfp8_e8m0_k32": "w8a8_mx",
         }[source_format]
     except KeyError as exc:
         raise ValueError(
@@ -122,11 +141,10 @@ def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
         ) from exc
 
 
-def _validate_trellis_runtime(source: TrellisConfig) -> None:
-    if source.codebook.value == "lut_fp16":
+def _validate_trellis_runtime(source: TrellisConfig, *, explicit_uniform: bool = False) -> None:
+    if source.codebook.value == "lut_fp16" and not explicit_uniform:
         raise NotImplementedError(
-            "lut_fp16 is defined by the checkpoint schema but is not "
-            "implemented by the routed fused MoE runtime"
+            "lut_fp16 preparation requires an explicit uniform_bits declaration"
         )
     if source.rate.group_size is not None:
         raise NotImplementedError(
@@ -164,6 +182,7 @@ def _prepared_format(
     recipe: str,
     constraints: WeightPlanConstraints,
 ) -> PreparedWeightFormat:
+    """Resolve the prepared weight format for a recipe from the preparation plan."""
     available = frozenset(WeightPacking(layout.value) for layout in plan.weight_layouts)
     required = plan.required_weight_layout(recipe)
     default_packing = (
@@ -177,7 +196,7 @@ def _prepared_format(
             f"required packing {packing.value!r} is not available; "
             f"planner produced {sorted(value.value for value in available)}"
         )
-    if isinstance(source, (TrellisConfig, Exl3Source)):
+    if isinstance(source, TrellisSource):
         weights = WeightEncoding.TRELLIS
         scales = ScaleEncoding.TRELLIS_SCALES
     else:
@@ -185,6 +204,8 @@ def _prepared_format(
             WeightEncoding(source.format.value) if source.format.value in BLOCK_CODECS else
             WeightEncoding.FP6_E2M3
             if source.format.value == "mxfp6_e2m3"
+            else WeightEncoding.FP8_E4M3
+            if source.format.value == "mxfp8_e8m0_k32"
             else WeightEncoding.FP4_E2M1
         )
         scales = ScaleEncoding(plan.specs[0].weight_scale.value)
@@ -212,9 +233,17 @@ def plan_weights(
     constraints = constraints or WeightPlanConstraints()
     if not isinstance(constraints, WeightPlanConstraints):
         raise TypeError("constraints must be WeightPlanConstraints")
+    if isinstance(source, TrellisConfig):
+        source = TrellisSource(config=source)
+    if activation.rotation_dtype is not None and not isinstance(source, TrellisSource):
+        raise ValueError("rotation_dtype is only valid for trellis weights")
 
     if isinstance(source, PackedSource):
         automatic = activation.mode is ActivationMode.AUTO
+        if activation.a16_max_tokens and (
+            source.format.value != "modelopt_nvfp4" or activation.io_dtype is not torch.bfloat16
+        ):
+            raise ValueError("A16 token cutoff requires BF16 inputs and ModelOpt NVFP4 weights")
         if automatic and (
             source.format.value != "modelopt_nvfp4"
             or activation.io_dtype is not torch.bfloat16
@@ -226,6 +255,7 @@ def plan_weights(
         if automatic and source.w13_layout.value != "w13":
             raise ValueError("automatic MoE precision requires up/gate W13 row order")
         recipe = _packed_recipe(source, ActivationMode.A4 if automatic else activation.mode)
+        shared_a16 = activation.a16_max_tokens > 0 and recipe != "w4a16"
         requested_layout = None
         if automatic:
             requested_layout = WeightPacking.SOURCE_NATIVE.value
@@ -242,75 +272,52 @@ def plan_weights(
                 )
             requested_layout = constraints.required_packing.value
         raw_plan = plan_b12x_fp4_moe_weights(
-            quant_modes=("nvfp4", "w4a16") if automatic else recipe,
+            quant_modes=(
+                ("nvfp4", "w4a16") if automatic else
+                (recipe, "w4a16") if shared_a16 else recipe
+            ),
             source_format=source.format.value,
             activation=activation.nonlinearity,
             params_dtype=activation.io_dtype,
             num_experts=geometry.num_experts,
             hidden_size=geometry.hidden_size,
             intermediate_size=geometry.intermediate_size,
-            w13_layout=source.w13_layout.value,
+            w13_layout="w13" if shared_a16 else source.w13_layout.value,
             w4a16_layout=requested_layout,
         )
-    elif isinstance(source, Exl3Source):
-        manifest = source.manifest
+    elif isinstance(source, TrellisSource):
+        config = source.config
+        if activation.a16_max_tokens:
+            raise ValueError("A16 token cutoff requires ModelOpt NVFP4 weights")
         if activation.mode is not ActivationMode.A16:
-            raise ValueError("EXL3 canonical preparation requires A16 activations")
-        if constraints.required_packing not in {
-            None,
-            WeightPacking.TRELLIS_NATIVE,
-        }:
-            raise ValueError("EXL3 weights require trellis_native packing")
-        if manifest.rates.structure != "uniform":
-            raise NotImplementedError(
-                "EXL3 canonical preparation requires uniform rates"
-            )
-        if (geometry.num_experts, geometry.hidden_size) != (
-            manifest.geometry.num_experts,
-            manifest.geometry.hidden_size,
-        ):
-            raise ValueError(
-                "EXL3 expert count and hidden width must match the manifest"
-            )
-        if geometry.intermediate_size > manifest.geometry.intermediate_size:
-            raise ValueError("EXL3 local intermediate width exceeds the source width")
-        recipe = "w4a16"
-        raw_plan = plan_b12x_fp4_moe_weights(
-            quant_modes=recipe,
-            source_format="exl3",
-            activation=activation.nonlinearity,
-            params_dtype=activation.io_dtype,
-            num_experts=geometry.num_experts,
-            hidden_size=geometry.hidden_size,
-            intermediate_size=geometry.intermediate_size,
-            w13_layout="w31",
-            w4a16_layout="trellis_native",
-            trellis_bits=manifest.rates.bits,
-            trellis_tile_config=(
-                (128, 128, 128, 128)
-                if manifest.hadamard.intermediate_hadamard and manifest.rates.bits == 2
-                else (64, 256, 64, 256)
-            ),
-            intermediate_hadamard=manifest.hadamard.intermediate_hadamard,
-            trellis_codebook=manifest.codebook,
-            trellis_rate_granularity=manifest.rates.structure,
-            intermediate_hadamard_blocks=(
-                (manifest.hadamard.pre_block, manifest.hadamard.post_block)
-                if manifest.hadamard.intermediate_hadamard
-                else None
-            ),
-        )
-    elif isinstance(source, TrellisConfig):
-        if activation.mode is not ActivationMode.A16:
-            raise ValueError("Trellis fused MoE currently requires A16 activations")
-        if constraints.required_packing not in {
-            None,
-            WeightPacking.TRELLIS_NATIVE,
-        }:
+            raise ValueError("Trellis fused MoE requires A16 activations")
+        if constraints.required_packing not in {None, WeightPacking.TRELLIS_NATIVE}:
             raise ValueError("Trellis weights require trellis_native packing")
-        _validate_trellis_runtime(source)
-        expert = source.transform.expert
+        _validate_trellis_runtime(config, explicit_uniform=source.uniform_bits is not None)
+        expert = config.transform.expert
+        if source.extent is not None:
+            if source.extent.intermediate_size != geometry.intermediate_size:
+                raise ValueError("trellis extent width differs from the weight geometry")
+            if expert.kind == "intermediate_hadamard" and (
+                32 * source.extent.first_slot % expert.post_block_size
+                or geometry.intermediate_size % expert.post_block_size
+            ):
+                raise ValueError("trellis extent must contain complete post-Hadamard blocks")
+        if activation.rotation_dtype is not None and (
+            config.codebook.value == "mcg" and source.uniform_bits is None
+        ):
+            raise ValueError("rotation_dtype requires a uniform full-rotation path")
         recipe = "w4a16"
+        bits = source.uniform_bits or 3
+        # Match the native K2 intermediate-Hadamard and projection-tiered
+        # geometries; container identity does not select an execution policy.
+        tile_config = (
+            (128, 128, 128, 128)
+            if expert.kind == "intermediate_hadamard" and bits == 2
+            else (128, 256, 64, 256)
+            if config.codebook.value == "mcg" and source.uniform_bits is None
+            else (64, 256, 64, 256)
+        )
         raw_plan = plan_b12x_fp4_moe_weights(
             quant_modes=recipe,
             source_format="b12x_trellis",
@@ -321,23 +328,18 @@ def plan_weights(
             intermediate_size=geometry.intermediate_size,
             w13_layout="w31",
             w4a16_layout="trellis_native",
-            trellis_bits=3,
-            trellis_tile_config=(
-                (128, 256, 64, 256)
-                if source.codebook.value == "mcg"
-                else (64, 256, 64, 256)
-            ),
+            trellis_bits=bits,
+            trellis_tile_config=tile_config,
             intermediate_hadamard=expert.kind == "intermediate_hadamard",
-            trellis_codebook=source.codebook.value,
-            trellis_rate_granularity=source.rate.granularity.value,
+            trellis_codebook=config.codebook.value,
+            trellis_rate_granularity=config.rate.granularity.value,
             intermediate_hadamard_blocks=(
-                None
-                if expert.kind == "none"
+                None if expert.kind == "none"
                 else (expert.pre_block_size, expert.post_block_size)
             ),
         )
     else:
-        raise TypeError("source must be a PackedSource, TrellisConfig or Exl3Source")
+        raise TypeError("source must be a PackedSource, TrellisConfig or TrellisSource")
 
     return WeightPlan(
         source=source,
@@ -356,38 +358,45 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights | IQ2XSWeights | Exl3Weights,
+    weights: PackedWeights | TrellisWeights | IQ2XSWeights,
+    device: torch.device | str | None = None,
+    staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
     """Materialize the in-memory representation selected by ``plan_weights``."""
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
+    if (device is not None or staging is not None) and not isinstance(plan.source, TrellisSource):
+        raise ValueError("device and staging are only supported for trellis preparation")
     if isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
         if not isinstance(weights, IQ2XSWeights) or weights.codec != plan.source.format.value:
             raise TypeError(f"{plan.source.format.value} preparation requires matching BlockQuantWeights")
         prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)
-    elif isinstance(plan.source, Exl3Source):
-        if not isinstance(weights, Exl3Weights):
-            raise TypeError("EXL3 preparation requires Exl3Weights")
-        if weights.layer.manifest != plan.source.manifest:
-            raise ValueError("EXL3 extent manifest differs from its weight plan")
-        prepared = prepare_b12x_fp4_moe_weights(
-            plan=plan._impl,
-            params_dtype=plan.activation.io_dtype,
-            exl3_layer=weights.layer,
-            exl3_device=weights.device,
-        )
-    elif isinstance(plan.source, TrellisConfig):
+    elif isinstance(plan.source, TrellisSource):
         if not isinstance(weights, TrellisWeights):
             raise TypeError("Trellis preparation requires TrellisWeights")
         prepared = prepare_b12x_trellis_v2_weights(
             plan=plan._impl,
-            config=plan.source,
+            source=plan.source,
             weights=weights,
+            device=device,
+            staging=staging,
+            rotation_dtype=plan.activation.rotation_dtype,
         )
     else:
         if not isinstance(weights, PackedWeights):
             raise TypeError("packed preparation requires PackedWeights")
+        if (plan.activation.a16_max_tokens and is_gated_moe_activation(plan._impl.activation)
+                and plan.source.w13_layout.value == "w31" and plan._impl.w13_layout == "w13"):
+            from ._impl import _ensure_w13_kernel_order_inplace
+
+            # Both activation precisions must see the same physical FC1 halves.
+            mode = _packed_recipe(plan.source, plan.activation.mode)
+            _ensure_w13_kernel_order_inplace(
+                weights.w13, weights.w13_block_scales,
+                n=plan.geometry.intermediate_size, k=plan.geometry.hidden_size,
+                quant_mode=mode,
+            )
         input_scale = weights.input_scale
         intermediate_scale = weights.intermediate_scale
         if plan.activation.mode is ActivationMode.A16:

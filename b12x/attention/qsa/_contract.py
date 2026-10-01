@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from b12x._lib.program_cache import program_cache
+
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -1228,6 +1230,7 @@ def _compile_rows(caps: Caps) -> tuple[int, ...]:
                  if 0 < rows <= int(caps.max_q_rows))
 
 
+@program_cache(scope="preparation")
 def compile_qsa(
     query_payload: FrozenMapping | Mapping[str, object],
     config_payload: FrozenMapping | Mapping[str, object],

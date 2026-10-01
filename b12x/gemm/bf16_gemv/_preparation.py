@@ -7,6 +7,7 @@ import torch
 
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from b12x.preparation.types import plan_from_handle, require_prepared
 
@@ -44,6 +45,7 @@ def query_from_call(x, weight, *, bias=None, out=None, output_dtype=None):
     return query
 
 
+@program_cache(scope="preparation")
 def compile_gemv(query_payload, config_payload, ordinal):
     """Compile only the selected kernel and retain its runtime launcher."""
     query = GemvQuery(**dict(query_payload))

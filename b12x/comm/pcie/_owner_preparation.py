@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     CollectiveRequirement,
     FrozenMapping,
@@ -133,6 +134,7 @@ def _selected_peers(runtime):
     return _selected_peers(runtime.rank, runtime.world_size)
 
 
+@program_cache(scope="preparation")
 def compile_owner_surface(query_payload, ordinal):
     """Resolve the exact existing CuTe getter from metadata-only query data."""
     import torch

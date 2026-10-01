@@ -14,6 +14,7 @@ import torch
 from b12x._lib.compile_plan import attach_programs, compile_only_launches, load_programs
 from b12x._lib.compiler import observe_launchers
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from b12x.preparation.types import require_prepared
 
@@ -22,6 +23,20 @@ from .mxfp4 import MXFP4PreparedState, materialize_mxfp4
 from .paged import index_topk_fp8
 from .tiled_topk import run_row_topk
 from .scratch import B12XIndexerScratchCaps, INDEXER_SOURCE_LAYOUT_PAGED, plan_indexer_scratch
+
+
+@dataclass(frozen=True)
+class _Mxfp4Programs:
+    launchers: Mapping
+
+    @property
+    def __b12x_dependencies__(self):
+        return tuple(self.launchers.values())
+
+    @property
+    def __b12x_programs__(self):
+        from b12x._lib.compile_plan import program_keys
+        return program_keys(self.__b12x_dependencies__)
 
 
 class _DsaIndexerState:
@@ -142,6 +157,7 @@ def _scratch_caps(query, *, device, config):
     )
 
 
+@program_cache(scope="preparation")
 def compile_indexer(query_payload, config_payload, ordinal):
     """Return retained concrete launchers for one selected native route.
 
@@ -167,7 +183,8 @@ def compile_indexer(query_payload, config_payload, ordinal):
             max_candidates=query.max_candidates,
             candidate_topk_blocks=query.candidate_topk_blocks,
         )
-        return materialize_mxfp4(caps, device_index=ordinal, score_kind=config.mxfp4_score_kind)
+        state = materialize_mxfp4(caps, device_index=ordinal, score_kind=config.mxfp4_score_kind)
+        return _Mxfp4Programs(state._launchers)
 
     descriptors = query.operands
     gathered: dict[object, object] = {}
@@ -323,8 +340,14 @@ def plan(caps, *, invocation: FrozenMapping = FrozenMapping(), override: DsaInde
                                       fused_merge=config.fused_merge)
         return MemoryRequirements(scratch=layout.scratch_specs())
     def materialize(selection, device):
+        programs = compile_indexer(
+            TUNING.encode_query(replace(query, exhaustive=False)),
+            TUNING.encode_config(selection.config), device.ordinal,
+        )
+        load_programs(programs)
         if query.cache_format == "mxfp4":
             from types import SimpleNamespace
+            from .mxfp4 import plan_mxfp4
             mx_caps = SimpleNamespace(
                 device=caps.device, num_q_heads=query.num_q_heads,
                 max_q_rows=query.max_q_rows,
@@ -333,20 +356,15 @@ def plan(caps, *, invocation: FrozenMapping = FrozenMapping(), override: DsaInde
                 max_candidates=query.max_candidates,
                 candidate_topk_blocks=query.candidate_topk_blocks,
             )
-            state = materialize_mxfp4(mx_caps, device_index=device.ordinal, score_kind=selection.config.mxfp4_score_kind)
-            load_programs(state)
-            return state
+            layout = plan_mxfp4(mx_caps, score_kind=selection.config.mxfp4_score_kind)
+            return MXFP4PreparedState(layout, programs.launchers)
         layout = plan_indexer_scratch(
             _scratch_caps(query, device=caps.device, config=selection.config),
             fused_merge=selection.config.fused_merge,
         )
-        launchers = compile_indexer(
-            TUNING.encode_query(replace(query, exhaustive=False)), TUNING.encode_config(selection.config),
-            device.ordinal,
-        )
+        launchers = programs
         if not isinstance(launchers, Mapping):
             raise TypeError("FP8 DSA compiler factory did not return launchers")
-        load_programs(launchers)
         return attach_programs(_DsaIndexerState(layout, selection.config, launchers), launchers)
     return Plan(contract=TUNING, query=query, invocation=invocation, override=override, _compile_jobs=compile_jobs, _memory_requirements=memory, _materialize=materialize, _device=caps.device)
 

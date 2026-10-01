@@ -14,7 +14,7 @@ from b12x.preparation import (
 )
 from b12x.preparation.session import PreparationJob
 from b12x.preparation._cache import SelectionCache
-from b12x.preparation.types import _CompositePlan
+from b12x.preparation.types import DeviceIdentity, _CompositePlan
 from b12x._lib.scratch import ScratchBufferSpec
 from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolution_guard
 from .test_defaults import Config, Query, contract
@@ -100,6 +100,34 @@ def test_compiler_process_budget_can_be_limited_without_disabling_tuning(
         assert engine.compile_workers == 2
 
 
+@pytest.mark.parametrize("identity, workers", [
+    (DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10"), 4),
+    (DeviceIdentity("nvidia", (12, 1), 48, "GB10"), 4),
+    (DeviceIdentity("nvidia", (12, 0), 170, "NVIDIA GeForce RTX 5090"), 8),
+    (None, 8),
+])
+def test_compiler_default_limits_spark_memory_across_stages(monkeypatch, identity, workers):
+    monkeypatch.delenv("B12X_COMPILE_WORKERS", raising=False)
+    with PreparationSession(device=DetectedDevice(None, identity)) as engine:
+        assert engine.compile_workers == workers
+        engine.configure_compile_workers(2)
+        engine.configure_compile_workers()
+        assert engine.compile_workers == workers
+
+
+def test_spark_compiler_budget_preserves_explicit_overrides(monkeypatch):
+    monkeypatch.setenv("B12X_COMPILE_WORKERS", "6")
+    device = DetectedDevice(None, DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10"))
+    with PreparationSession(device=device, compile_workers=1) as engine:
+        assert engine.compile_workers == 1
+        engine.configure_compile_workers()
+        assert engine.compile_workers == 6
+        engine.configure_compile_workers(0)
+        assert engine.compile_workers == 0
+    with PreparationSession(device=device) as engine:
+        assert engine.compile_workers == 6
+
+
 def declaration(*, tuning=None, pin=None, shared=False):
     """Build a minimal arithmetic plan for preparation state-machine tests."""
     tuning = contract(values=(2,)) if tuning is None else tuning
@@ -157,6 +185,116 @@ def test_prepare_fills_plans_in_place_and_release_runs_closers(tmp_path):
     engine.close()
     assert sorted(closed) == ["a", "b"]
     assert b.plan.prepared is None
+
+
+def test_job_bundle_memo_ends_at_completion_but_plan_programs_survive(tmp_path):
+    import weakref
+    from b12x._lib import compile_plan, program_cache
+
+    built = []
+    key = compile_plan.ProgramKey("cute", "7" * 64, "job-owned")
+
+    @program_cache.program_cache
+    def executable():
+        return compile_plan.CompiledCuTeProgram(lambda: 23, key)
+
+    @program_cache.program_cache(scope="preparation")
+    def factory():
+        built.append(1)
+        return executable()
+
+    def make(name):
+        plan = replace(declaration(), _materialize=lambda *_: compile_plan.load_programs(factory()))
+        return plan.request(name=name, prepare_call=lambda state: PreparedCall(run=state))
+
+    with session(tmp_path, autotune=False) as engine:
+        requests = (make("a"), make("b"))
+        job = engine.begin(requests)
+        while not job.advance().done:
+            pass
+        assert not job._program_cache._caches
+        assert built == [1]
+        owner = weakref.ref(requests[0].plan.prepared.state)
+        assert owner() is requests[1].plan.prepared.state
+        engine.release_many((requests[0].plan,))
+        assert requests[1].plan.prepared.state() == 23
+        assert executable.cache_info().currsize == 1
+        engine.release_many((requests[1].plan,))
+        assert executable.cache_info().currsize == 0
+        assert owner() is None
+        engine.prepare((make("later"),))
+        assert built == [1, 1]
+
+
+def test_bulk_release_attempts_all_closers_and_reclaims_once(tmp_path, monkeypatch):
+    closed, reclaimed = [], []
+
+    def close(name):
+        closed.append(name)
+        if name == "a":
+            raise RuntimeError("closer failed")
+
+    with session(tmp_path) as engine:
+        requests = tuple(request(name=name, close=lambda name=name: close(name)) for name in ("a", "b"))
+        engine.prepare(requests)
+        reclaim = engine._reclaim_programs
+        monkeypatch.setattr(engine, "_reclaim_programs", lambda: (reclaimed.append(1), reclaim()))
+        with pytest.raises(RuntimeError, match="closer failed"):
+            engine.release_many(item.plan for item in requests)
+        assert closed == ["a", "b"]
+        assert reclaimed == [1]
+        assert all(item.plan.prepared is None for item in requests)
+        engine.release_many(item.plan for item in requests)
+        assert reclaimed == [1]
+
+
+def test_closing_one_session_preserves_another_sessions_executable(tmp_path):
+    from b12x._lib import compile_plan, program_cache
+
+    @program_cache.program_cache
+    def executable():
+        return compile_plan.CompiledCuTeProgram(lambda: 41, compile_plan.ProgramKey("cute", "6" * 64))
+
+    def make(name):
+        plan = replace(declaration(), _materialize=lambda *_: compile_plan.load_programs(executable()))
+        return plan.request(name=name, prepare_call=lambda state: PreparedCall(run=state))
+
+    with session(tmp_path, autotune=False) as first, session(tmp_path, autotune=False) as second:
+        a, b = make("a"), make("b")
+        first.prepare((a,))
+        second.prepare((b,))
+        first.close()
+        assert b.plan.prepared.state() == 41
+        assert executable.cache_info().currsize == 1
+        second.close()
+        assert executable.cache_info().currsize == 0
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_job_factory_scope_clears_on_failure_or_early_close(tmp_path, cancel):
+    from b12x._lib.program_cache import PreparationProgramCache, program_cache
+
+    @program_cache(scope="preparation")
+    def factory():
+        return SimpleNamespace(value=3)
+
+    def fail(state):
+        raise RuntimeError("binding failed")
+
+    plan = replace(declaration(), _materialize=lambda *_: factory())
+    with session(tmp_path, autotune=False) as engine:
+        job = engine.begin((plan.request(name="a", prepare_call=fail),))
+        if cancel:
+            with job._program_cache.activate():
+                factory()
+            job.close()
+        else:
+            with pytest.raises(RuntimeError, match="binding failed"):
+                while not job.advance().done:
+                    pass
+        assert not job._program_cache._caches
+        with PreparationProgramCache().activate():
+            assert factory().value == 3
 
 
 def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
@@ -465,6 +603,139 @@ def test_race_batches_bound_residency_and_carry_the_champion(tmp_path, monkeypat
     assert sorted(trial_closed) == [3, 6, 12, 24]
 
 
+def _cuda_error(monkeypatch, code=720):
+    from cutlass.base_dsl import common
+
+    # Construct the actual DSL exception without querying a CUDA context.
+    monkeypatch.setattr(common, "_get_friendly_cuda_error_message",
+                        lambda code, name: (f"{name} ({code})", "", ""))
+    return common.DSLCudaRuntimeError(code, "test CUDA launch error")
+
+
+@pytest.mark.parametrize("rejected", ((3,), (12,), (3, 6)))
+def test_unlaunchable_trials_release_scratch_and_race_survivors(
+    tmp_path, monkeypatch, caplog, rejected,
+):
+    batches, events = [], []
+    _deterministic_timer(monkeypatch, batches=batches)
+    error = _cuda_error(monkeypatch)
+
+    def benchmark(state):
+        def run():
+            events.append(("run", state.value))
+            if state.value in rejected:
+                raise error
+            return state.value
+
+        return PreparedCall(
+            run=run, produce=lambda: None,
+            restore=lambda: events.append(("restore", state.value)),
+            close=lambda: events.append(("close", state.value)),
+        )
+
+    with session(tmp_path, race_batch=1) as engine:
+        monkeypatch.setattr(engine, "_synchronize", lambda: events.append("sync"))
+        result = engine.prepare((request(name="race", tuning=contract(), benchmark=benchmark),))
+        survivors = {3, 6, 12} - set(rejected)
+        assert result.selections["race"].config.width * 3 in survivors
+        assert result.benchmarked_candidates == len(survivors)
+        assert result.coverage["race"]["measured_count"] == len(survivors)
+        assert all(set(batch) <= survivors for batch in batches)
+        # The cache accepts only fully measured races.
+        assert not engine._cache.records
+    for value in rejected:
+        start = events.index(("run", value))
+        assert events[start + 1:start + 4] == ["sync", ("restore", value), ("close", value)]
+        assert events.count(("close", value)) == 1
+    assert caplog.text.count("Skipping race candidate") == len(rejected)
+
+
+def test_all_trials_rejected_fail_without_installing_a_default(tmp_path, monkeypatch):
+    error = _cuda_error(monkeypatch)
+    closed, prepared = [], []
+
+    def benchmark(state):
+        def run():
+            raise error
+        return PreparedCall(run=run, close=lambda: closed.append(state.value))
+
+    req = request(name="race", tuning=contract(), calls=prepared, benchmark=benchmark)
+    with session(tmp_path) as engine:
+        with pytest.raises(RuntimeError, match="no launchable candidates for race: all 3"):
+            engine.prepare((req,))
+        assert req.plan.prepared is None
+        assert not engine._cache.records
+    assert closed == [3, 6, 12]
+    assert not prepared
+
+
+@pytest.mark.parametrize("failure", ("cuda", "text", "factory", "restore", "sync", "selected"))
+def test_candidate_recovery_keeps_other_failures_fatal(tmp_path, monkeypatch, failure):
+    _deterministic_timer(monkeypatch)
+    error = (_cuda_error(monkeypatch, 700 if failure == "cuda" else 720)
+             if failure != "text" else RuntimeError("CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE (720)"))
+    attempted = []
+
+    def fail():
+        raise error
+
+    def cleanup_failure():
+        raise RuntimeError("cleanup failed")
+
+    def benchmark(state):
+        attempted.append(state.value)
+        if failure == "factory":
+            fail()
+        return PreparedCall(
+            run=(lambda: state.value) if failure == "selected" else fail,
+            restore=cleanup_failure if failure == "restore" else None,
+        )
+
+    req = request(name="race", tuning=contract(), benchmark=benchmark)
+    if failure == "selected":
+        req = replace(req, prepare_call=lambda state: PreparedCall(run=fail))
+    with session(tmp_path) as engine:
+        if failure == "sync":
+            monkeypatch.setattr(engine, "_synchronize", cleanup_failure)
+        with pytest.raises(RuntimeError, match="cleanup failed" if failure in {"restore", "sync"} else "failed to prepare"):
+            engine.prepare((req,))
+        assert req.plan.prepared is None
+    assert attempted == ([3, 6, 12] if failure == "selected" else [3])
+
+
+def test_rejected_shard_accepts_a_peer_winner_without_claiming_full_measurement(
+    tmp_path, monkeypatch,
+):
+    from b12x.preparation import TuningRequirement
+
+    error = _cuda_error(monkeypatch)
+
+    def benchmark(state):
+        def run():
+            raise error
+        return PreparedCall(run=run)
+
+    with session(tmp_path) as engine:
+        engine.configure_tuning_shard(0, (0, 1))
+        req = request(name="race", tuning=contract(values=(1, 2)), benchmark=benchmark)
+        job = engine.begin((req,))
+        snapshot = job.advance().ready_cache
+        progress = job.advance(cache=(snapshot, snapshot))
+        while not progress.ready_tuning:
+            progress = job.advance()
+        contribution, = progress.ready_tuning
+        assert contribution.assignment is None and contribution.rejected_count == 1
+        winner = TuningRequirement(contribution.key, (0, 1), {"width": 2}, 1.0, 1, 1)
+        progress = job.advance(tuning=(winner,))
+        while not progress.done:
+            progress = job.advance()
+        result = job.result()
+        assert req.plan.selection.config.width == 2
+        assert result.coverage["race"]["measured_count"] == 1
+        assert result.benchmarked_candidates == 0
+        assert not engine._cache.records
+
+
 @pytest.mark.parametrize("cached_ranks", ((), (0,), (1,), (0, 1)))
 def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
     tmp_path, monkeypatch, cached_ranks,
@@ -534,10 +805,11 @@ def test_two_ranks_agree_on_cached_choices_and_shard_remaining_races(
 
     results = [job.result() for job in jobs]
     try:
-        # SparkRing reraces distributed selections even after cache agreement.
-        assert [result.benchmarked_candidates for result in results] == [4, 4]
+        # Reconciled cache records are used on every rank; unreconciled
+        # distributed selections are raced again.
+        assert [result.benchmarked_candidates for result in results] == ([2, 2] if cached_ranks else [4, 4])
         assert [result.selections["shared"].config.width for result in results] == [2, 2]
-        assert [result.selections["shared"].source for result in results] == ["tuned"] * 2
+        assert [result.selections["shared"].source for result in results] == (["cached"] * 2 if cached_ranks else ["tuned"] * 2)
         assert all(result.selections["fresh"].source == "tuned" for result in results)
         assert [result.coverage["shared"]["measured_count"] for result in results] == [4, 4]
         assert [req[0].plan.selection.config.width for req in requests] == [2, 2]

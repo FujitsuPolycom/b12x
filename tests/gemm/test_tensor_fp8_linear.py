@@ -335,3 +335,21 @@ def test_capacity_regime_serves_dynamic_rows_under_frozen_resolution() -> None:
                 torch.testing.assert_close(actual, exact[rows], rtol=1e-2, atol=2e-3)
             with pytest.raises(ValueError, match="exceed capacity"):
                 tensor_fp8_linear.mm(source, packed, plan=plan)
+
+
+def test_prewarm_primes_dynamic_capacity_before_frozen_resolution() -> None:
+    from b12x._lib.runtime_control import kernel_resolution_guard
+
+    require_b12x()
+    source, weight, scale, packed = _make_inputs(130, 256, 144)
+    with (
+        kernel_resolution_guard("cold implicit plan"),
+        pytest.raises(RuntimeError, match="not prepared.*frozen"),
+    ):
+        tensor_fp8_linear.mm(source, packed)
+    assert tensor_fp8_linear.prewarm(packed, [129, 130, 0, 129]) == 2
+    with kernel_resolution_guard("prewarmed implicit plan"):
+        for rows in (129, 130):
+            actual = tensor_fp8_linear.mm(source[:rows], packed)
+            reference = source[:rows].float() @ weight.float().T * scale
+            torch.testing.assert_close(actual.float(), reference, atol=2e-3, rtol=1e-2)

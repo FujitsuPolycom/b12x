@@ -142,7 +142,7 @@ def compile_mhc(query_payload, config_payload, native_payload, ordinal):
     )
 
 
-@program_cache
+@program_cache(scope="preparation")
 def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
     """Compile exactly the chosen branch using shape-faithful CUDA FakeTensors."""
     from torch._subclasses.fake_tensor import FakeTensorMode

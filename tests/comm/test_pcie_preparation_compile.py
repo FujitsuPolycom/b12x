@@ -43,7 +43,8 @@ def test_attention_group_support_does_not_enable_kimi_projection_shards(world, o
         TUNING.validate_query(query, None)
 
 
-def test_prepared_pair_call_executes_both_output_bindings():
+@pytest.mark.parametrize("options,expected_threads", [({}, 512), ({"threads": 128}, 128)])
+def test_prepared_pair_call_executes_both_output_bindings(options, expected_threads):
     from b12x.comm.pcie._dcp_preparation import _DcpExecutionState, prepare_call
     runtime = Mock()
     first, second = torch.ones(2, 32), torch.ones(2, 16)
@@ -53,12 +54,36 @@ def test_prepared_pair_call_executes_both_output_bindings():
                      setup=FrozenMapping())
     state = _DcpExecutionState(query, runtime, {})
     call = prepare_call(state, local_first=first, local_second=second,
-                        out_first=out_first, out_second=out_second, threads=128)
+                        out_first=out_first, out_second=out_second, **options)
     call.run()
     runtime._all_gather_pair_on_device.assert_called_once_with(
-        first, second, out_first, out_second, state=state, threads=128,
+        first, second, out_first, out_second, state=state, threads=expected_threads,
     )
     assert call.output == (out_first, out_second)
+
+
+@pytest.mark.parametrize("module,factory", [
+    ("_hierarchical_cute", "get_hierarchical_launcher"),
+    ("_island_rs_cute", "get_island_rs_launcher"),
+    ("_vocab_argmax_cute", "get_vocab_argmax_launcher"),
+])
+def test_owner_launcher_exposes_compiler_dependencies(monkeypatch, module, factory):
+    from importlib import import_module
+    from b12x._lib.compile_plan import ProgramKey
+
+    kernels = import_module(f"b12x.comm.pcie.{module}")
+    program = ProgramKey("cute", "test-owner", factory)
+    raw = Mock(__b12x_programs__=(program,))
+    monkeypatch.setattr(kernels, "b12x_compile", lambda *args, **kwargs: raw)
+    monkeypatch.setattr(kernels, "make_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
+    monkeypatch.setattr(
+        kernels, "raise_if_kernel_resolution_frozen", lambda *args, **kwargs: None
+    )
+
+    launcher = getattr(kernels, factory).__wrapped__(16, 0, 0, wait_nanosleep_cycles=24)
+    assert program_keys(launcher) == (program,)
+    assert launcher.__b12x_dependencies__ == (raw,)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA compilation")

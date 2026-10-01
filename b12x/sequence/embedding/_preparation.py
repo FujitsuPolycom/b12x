@@ -1,4 +1,6 @@
 """Metadata compilation and retained execution for unquantized embedding lookup."""
+
+from b12x._lib.program_cache import program_cache
 from dataclasses import dataclass
 
 import torch
@@ -19,6 +21,7 @@ def query_from_call(weight, ids, *, out, num_rows=None):
     )
 
 
+@program_cache(scope="preparation")
 def compile_lookup(payload, ordinal):
     from ._kernel import compile_embedding
     query = EmbeddingQuery(**dict(payload))

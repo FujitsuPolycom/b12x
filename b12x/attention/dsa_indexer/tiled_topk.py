@@ -547,12 +547,6 @@ def _flat_tensor_meta_key(tensor):
     )
 
 
-def _buffers_alias(left, right) -> bool:
-    if hasattr(left, "fake_mode") or hasattr(right, "fake_mode"):
-        return False
-    return left.data_ptr() == right.data_ptr()
-
-
 class DSATiledTopkKernel:
     def __init__(
         self,

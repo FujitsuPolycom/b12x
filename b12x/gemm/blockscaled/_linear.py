@@ -13,7 +13,10 @@ from typing import Any, TypeAlias
 import cutlass.cute as cute
 import torch
 
-from b12x._lib.dense_gemm import _dense_spark_policy_for_sm_count
+from b12x._lib.dense_gemm import (
+    _dense_spark_policy_for_sm_count,
+    dense_gemm,
+)
 from b12x._lib.utils import cuda_stream_to_int
 from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8Rows,
@@ -445,11 +448,16 @@ def pack_weight(
     )
 
 
-def _fixed_state(plan_handle: int, source: torch.Tensor):
-    """Prepared fixed state for ``source``, resolving a declared regime by its rows."""
-    state = require_prepared(
-        plan_from_handle(plan_handle), "gemm.blockscaled.fixed", source.device
-    )
+def _fixed_state(declaration, source: torch.Tensor):
+    """Prepared fixed state for ``source``, resolving a declared regime by its rows.
+
+    A fixed row-regime plan (``plan_regimes`` over a capacity
+    ``FixedBlockscaledQuery``) materializes a state whose ``resolve`` selects
+    the exact static-shape child for the live row count, else the capacity
+    child, and rejects rows above the capacity. Single-shape plans have no
+    ``resolve`` and serve ``source`` directly.
+    """
+    state = require_prepared(declaration, "gemm.blockscaled.fixed", source.device)
     resolve = getattr(state, "resolve", None)
     return state if resolve is None else resolve(source)
 
@@ -472,8 +480,17 @@ def _blockscaled_serialized_op(
     block_fp8: bool,
     plan_handle: int,
     stream_int: int | None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
-    state = _fixed_state(plan_handle, lhs_values)
+    declaration = plan_from_handle(plan_handle) if plan_handle else None
+    if declaration is None:
+        from ._preparation import heuristic_plan, query_from_call
+        declaration = heuristic_plan(query_from_call(
+            (lhs_values, lhs_scale_storage), (rhs_values, rhs_scale_storage),
+            alpha=alpha, ab_dtype=ab_dtype, sf_dtype=sf_dtype, c_dtype=c_dtype,
+            sf_vec_size=sf_vec_size, block_fp8=block_fp8, expected_m=expected_m,
+        ), lhs_values.device)
+    state = _fixed_state(declaration, lhs_values)
     return state.run_serialized(
         lhs_values,
         lhs_scale_storage,
@@ -503,6 +520,7 @@ def _blockscaled_serialized_fake(
     block_fp8: bool,
     plan_handle: int,
     stream_int: int | None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
     del lhs_scale_storage, rhs_scale_storage, alpha
     del ab_dtype, sf_dtype, sf_vec_size, block_fp8, plan_handle, stream_int
@@ -523,8 +541,10 @@ def _packed_mxfp8_op(
     weight_scale_mma: torch.Tensor,
     plan_handle: int,
     stream_int: int | None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
-    state = _fixed_state(plan_handle, source_2d)
+    declaration = _fixed_plan(plan_handle, source_2d, weight_values, "mxfp8", source_2d.dtype, expected_m=expected_m)
+    state = _fixed_state(declaration, source_2d)
     return state.run_mxfp8(
         source_2d,
         weight_values,
@@ -541,6 +561,7 @@ def _packed_mxfp8_fake(
     weight_scale_mma: torch.Tensor,
     plan_handle: int,
     stream_int: int | None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
     del weight_scale_mma, plan_handle, stream_int
     return torch.empty(
@@ -563,8 +584,11 @@ def _packed_mxfp8_prequantized_op(
     plan_handle: int,
     out_dtype: torch.dtype,
     stream_int: int | None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
-    state = _fixed_state(plan_handle, source_values)
+    declaration = _fixed_plan(plan_handle, source_values, weight_values, "mxfp8", out_dtype,
+                              source_scale_storage, expected_m=expected_m)
+    state = _fixed_state(declaration, source_values)
     return state.run_mxfp8(
         source_values,
         weight_values,
@@ -584,6 +608,7 @@ def _packed_mxfp8_prequantized_fake(
     plan_handle: int,
     out_dtype: torch.dtype,
     stream_int: int | None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
     del source_scale_storage, weight_scale_mma, plan_handle, stream_int
     return torch.empty(
@@ -591,6 +616,25 @@ def _packed_mxfp8_prequantized_fake(
         dtype=out_dtype,
         device=source_values.device,
     )
+
+
+def _fixed_plan(handle, source, weight, recipe, out_dtype, source_scale=None, *, expected_m=None):
+    if handle:
+        return plan_from_handle(handle)
+    from ._preparation import heuristic_plan
+    from ._tuning import FixedBlockscaledQuery
+    m, k = source.shape
+    form = "none"
+    if source_scale is not None:
+        form = ("compact" if source_scale.ndim == 2 and source_scale.shape == (m, k // 32)
+                else "mma" if source_scale.ndim == 6 else "swizzled")
+    return heuristic_plan(FixedBlockscaledQuery(
+        recipe=recipe, call_kind="packed", max_rows=m, in_features=k,
+        padded_in_features=weight.shape[1], out_features=weight.shape[0],
+        input_dtype=str(source.dtype).removeprefix("torch."),
+        output_dtype=str(out_dtype).removeprefix("torch."), expected_m=expected_m,
+        source_scale_form=form,
+    ), source.device)
 
 
 def _validate_bias(
@@ -616,7 +660,8 @@ def mxfp8_linear(
     source: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     packed_weight: MXFP8LinearWeight,
     *,
-    plan: Plan,
+    plan: Plan | None = None,
+    expected_m: int | None = None,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
     stream: object = None,
@@ -670,6 +715,7 @@ def mxfp8_linear(
             source_values,
             packed_weight,
             plan=plan,
+            expected_m=expected_m,
             bias=bias,
             out_dtype=resolved_out_dtype,
             stream=stream,
@@ -695,17 +741,19 @@ def mxfp8_linear(
             source_scale,
             packed_weight.weight.values,
             packed_weight.weight.scale_mma,
-            plan.handle,
+            0 if plan is None else plan.handle,
             resolved_out_dtype,
             cuda_stream_to_int(stream),
+            expected_m,
         )
     else:
         output = torch.ops.b12x.blockscaled_packed_mxfp8(
             source_2d,
             packed_weight.weight.values,
             packed_weight.weight.scale_mma,
-            plan.handle,
+            0 if plan is None else plan.handle,
             cuda_stream_to_int(stream),
+            expected_m,
         )
     if bias is not None:
         output = output + bias
@@ -725,8 +773,10 @@ def _packed_tensor_fp8_op(
     plan_handle: int,
     out_dtype: torch.dtype,
     stream_int: int | None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
-    state = _fixed_state(plan_handle, source_2d)
+    declaration = _fixed_plan(plan_handle, source_2d, weight_values, "tensor_fp8", out_dtype, expected_m=expected_m)
+    state = _fixed_state(declaration, source_2d)
     return state.run_tensor_fp8(
         source_2d,
         weight_values,
@@ -748,6 +798,7 @@ def _packed_tensor_fp8_fake(
     plan_handle: int,
     out_dtype: torch.dtype,
     stream_int: int | None,
+    expected_m: int | None = None,
 ) -> torch.Tensor:
     del weight_scale_mma, weight_block_scale, output_scale, plan_handle, stream_int
     return torch.empty(
@@ -761,7 +812,8 @@ def tensor_fp8_linear(
     source: torch.Tensor,
     packed_weight: TensorFP8LinearWeight,
     *,
-    plan: Plan,
+    plan: Plan | None = None,
+    expected_m: int | None = None,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
     stream: object = None,
@@ -804,9 +856,10 @@ def tensor_fp8_linear(
             packed_weight.scale_mma,
             packed_weight.block_scale,
             packed_weight.output_scale,
-            plan.handle,
+            0 if plan is None else plan.handle,
             out_dtype,
             cuda_stream_to_int(stream),
+            expected_m,
         )
     if bias is not None:
         output = output + bias
@@ -818,12 +871,14 @@ def blockscaled_mm(
     rhs: Weight | tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor | None = None,
     *,
-    plan: Plan,
+    plan: Plan | None = None,
+    expected_m: int | None = None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """Dispatch packed linear weights or preserve the raw ``dense_gemm`` API."""
-    if plan is None:
-        raise TypeError("blockscaled.mm requires a prepared Plan")
+
+    if plan is None and isinstance(rhs, IQ2XSLinearWeight):
+        raise TypeError("block-quantized linear weights require a prepared Plan")
 
     if isinstance(rhs, (NVFP4LinearWeight, IQ2XSLinearWeight)) or (
         isinstance(rhs, MXFP8LinearWeight) and isinstance(lhs, torch.Tensor)
@@ -850,7 +905,7 @@ def blockscaled_mm(
         result = linear(
             lhs, values, scales, global_scale, plan=plan,
             global_scale_kind=rhs.global_scale_kind if fp4 else "none",
-            out=out, **options,
+            out=out, expected_m=expected_m, **options,
         )
         if bias is not None:
             from ._a16 import _stream_context
@@ -860,7 +915,7 @@ def blockscaled_mm(
     if isinstance(rhs, MXFP8LinearWeight):
         if out is not None:
             raise ValueError("packed MXFP8 blockscaled.mm does not accept out")
-        return mxfp8_linear(lhs, rhs, plan=plan, **kwargs)
+        return mxfp8_linear(lhs, rhs, plan=plan, expected_m=expected_m, **kwargs)
     if isinstance(rhs, TensorFP8LinearWeight):
         if out is not None:
             raise ValueError("packed tensor-FP8 blockscaled.mm does not accept out")
@@ -870,7 +925,7 @@ def blockscaled_mm(
                 "values tensor directly; its static scale is already folded "
                 "into the packed weight"
             )
-        return tensor_fp8_linear(lhs, rhs, plan=plan, **kwargs)
+        return tensor_fp8_linear(lhs, rhs, plan=plan, expected_m=expected_m, **kwargs)
     if not isinstance(lhs, tuple) or not isinstance(rhs, tuple):
         raise TypeError(
             "raw blockscaled.mm operands must be (values, scale) pairs, or rhs "
@@ -916,9 +971,12 @@ def blockscaled_mm(
             str(c_dtype),
             int(sf_vec_size),
             block_fp8,
-            plan.handle,
+            0 if plan is None else plan.handle,
             cuda_stream_to_int(stream),
+            expected_m,
         )
+    if plan is None:
+        return dense_gemm(lhs, rhs, out, expected_m=expected_m, **kwargs)
     from b12x.gemm._preparation import mm as prepared_mm
     return prepared_mm(lhs, rhs, out, plan=plan, **kwargs)
 

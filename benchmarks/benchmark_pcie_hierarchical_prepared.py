@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
+import shlex
+import subprocess
+import sys
 import traceback
 from datetime import timedelta
 from pathlib import Path
@@ -70,7 +74,23 @@ def main():
     status = ctypes.CDLL(nccl_path).ncclGetVersion(ctypes.byref(nccl_version))
     if status:
         raise RuntimeError(f"ncclGetVersion failed: {status}")
+    source = Path(__file__).resolve()
+    repo = source.parent.parent
+
+    def git_output(*arguments):
+        return subprocess.check_output(["git", *arguments], cwd=repo, text=True)
+
     report = {
+        "command": shlex.join(sys.orig_argv),
+        "repository_revision": git_output("rev-parse", "HEAD").strip(),
+        "worktree_status": git_output("status", "--porcelain"),
+        "tracked_diff_sha256": hashlib.sha256(
+            git_output("diff", "HEAD", "--binary").encode()
+        ).hexdigest(),
+        "benchmark_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "physical_gpu_configuration_xml": subprocess.check_output(
+            ["nvidia-smi", "-q", "-x", "-i", str(properties.uuid)], text=True
+        ),
         "world_size": world,
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
@@ -84,7 +104,7 @@ def main():
             for key, value in os.environ.items()
             if key.startswith(("B12X_PCIE_", "NCCL_"))
         },
-        "conditions": "no concurrent GPU requests; existing allocations are not evicted",
+        "required_conditions": "no concurrent GPU requests; existing allocations are not evicted",
         "free_memory_bytes": torch.cuda.mem_get_info(device)[0],
         "latency_unit": "microseconds per collective; slowest rank",
         "cases": [],

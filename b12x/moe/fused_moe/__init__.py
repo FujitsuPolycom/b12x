@@ -48,6 +48,11 @@ activation precision independent:
 Primary capacity preparation is declarative. Runtime binding requires the
 session-prepared ``Plan``; route and FC2 work are materialized as part of
 that prepared plan rather than public alternate launch paths.
+
+Tensor-based callers may also use ``plan_weights(quant_modes=...)``,
+``prepare_weights`` with tensor arguments, and ``plan(Caps(...))``. These
+scratch plans use the validated heuristic configuration without autotuning;
+warm their bindings before CUDA graph capture.
 """
 
 from __future__ import annotations
@@ -61,8 +66,11 @@ META = OpMeta(
     group="moe",
     api_style="planned",
     entry_points=(
-        "Exl3Source",
-        "Exl3Weights",
+        "Caps",
+        "plan",
+        "TrellisExtent",
+        "TrellisSource",
+        "TrellisStaging",
         "ActivationMode",
         "ActivationSpec",
         "Binding",
@@ -114,6 +122,7 @@ META = OpMeta(
         "w4a8_mx",
         "w4a8_nvfp4",
         "w6a8_mx",
+        "w8a8_mx",
         "w4a16",
         "b12x_trellis",
     ),
@@ -129,8 +138,11 @@ META = OpMeta(
 
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
-        Exl3Source,
-        Exl3Weights,
+        Caps,
+        plan,
+        TrellisExtent,
+        TrellisSource,
+        TrellisStaging,
         ActivationMode,
         ActivationSpec,
         Binding,

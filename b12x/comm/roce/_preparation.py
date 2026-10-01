@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan, PreparedCall
 
 from ._tuning import RoceQuery, TUNING
@@ -18,6 +19,7 @@ def _dtypes(query: RoceQuery) -> tuple[torch.dtype, ...]:
     return tuple(getattr(torch, value) if isinstance(value, str) else value for value in values)
 
 
+@program_cache(scope="preparation")
 def compile_roce(payload, ordinal: int):
     """Resolve exactly the all-reduce/all-gather launchers in a declaration."""
     from . import _allgather_cute
@@ -115,9 +117,9 @@ def plan(
 
     def materialize(selection, device):
         programs = compile_roce(payload, device.ordinal)
-        gather = programs.pop("gather")
+        gather = programs["gather"]
         runtime._prepare_resources(_dtypes(query), padded_gather=True)
-        return _PreparedRoce(runtime, programs, gather)
+        return _PreparedRoce(runtime, {key: value for key, value in programs.items() if key != "gather"}, gather)
 
     return Plan(
         contract=TUNING,

@@ -13,6 +13,7 @@ from typing import Mapping
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     FrozenMapping,
     MemoryRequirements,
@@ -97,6 +98,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     return PcieQuery(surface=surface, world_size=int(runtime.world_size), rank=int(runtime.rank), topology="pcie_ipc", call=FrozenMapping(metadata), setup=setup)
 
 
+@program_cache(scope="preparation")
 def compile_dcp_surface(query_payload, ordinal):
     """Compile every eager/graph native variant represented by a declaration."""
     from . import _dcp_a2a_cute as cute
@@ -142,12 +144,6 @@ class _DcpExecutionState:
             return self.runtime._lse_reduce_scatter_on_device(call["partial_output"], call["partial_lse"], call.get("out"), state=self, is_lse_base_on_e=call.get("is_lse_base_on_e", True), threads=call.get("threads", 256), block_limit=call.get("block_limit", 16))
         if surface.endswith("all_gather_heads"):
             return self.runtime._all_gather_heads_on_device(call["local_input"], call.get("out"), state=self, threads=call.get("threads", 256), block_limit=call.get("block_limit", 16))
-        if surface.endswith("all_gather_pair"):
-            return self.runtime._all_gather_pair_on_device(
-                call["local_first"], call["local_second"],
-                call.get("out_first"), call.get("out_second"), state=self,
-                threads=call.get("threads", 256),
-            )
         if surface.endswith("all_gather_pair_kimi_topk"):
             return self.runtime._all_gather_pair_kimi_topk_on_device(call["local_down"], call["local_router"], call["correction_bias"], call.get("out_down"), call.get("topk_weights"), call.get("topk_ids"), state=self)
         if surface.endswith("all_gather_pair"):

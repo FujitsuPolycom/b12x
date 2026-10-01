@@ -8,6 +8,7 @@ import torch
 import triton
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._impl import Binding, Caps, KdaBinding, _bind, _bind_kda, _scratch_layout
 from ._tuning import GdnConfig, GdnQuery, TUNING, _OPERANDS, aligned_operands
@@ -148,6 +149,7 @@ def _metadata_binding(query, layout):
     return cls(_state=layout, scratch=scratch, **data)
 
 
+@program_cache(scope="preparation")
 def compile_decode(query_payload, config_payload, ordinal):
     from . import _kernels as kernels
     query = GdnQuery(**dict(query_payload))

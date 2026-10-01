@@ -7,6 +7,7 @@ from types import MappingProxyType
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation.types import FrozenMapping, MemoryRequirements, Plan, require_prepared
 
 from ._scratch import Binding, Caps, _dense_mla_scratch_layout, _materialize, plan_dense_mla_scratch
@@ -306,6 +307,7 @@ def _caps(query: DenseMlaQuery, config: DenseMlaConfig, device: torch.device) ->
     )
 
 
+@program_cache(scope="preparation")
 def compile_dense_mla(query_payload, config_payload, ordinal):
     """Compile selected forward/merge/quantizer entries from FakeTensor metadata."""
     from torch._subclasses.fake_tensor import FakeTensorMode

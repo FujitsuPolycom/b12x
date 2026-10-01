@@ -1,12 +1,12 @@
 """Representative activation-producing races owned by preparation."""
 from __future__ import annotations
-import gc
-import threading
 
 import ctypes
+import gc
 import math
 import os
 import statistics
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -157,6 +157,20 @@ class _StreamGate:
         self.streams.clear()
 
 
+@contextmanager
+def _collection_paused():
+    """Keep automatic garbage collection out of a gated sample.
+
+    A collection can finalize an unreferenced CuTe module, whose
+    ``cudaLibraryUnload`` waits for queued device work. Work behind the stream
+    gate waits for this thread to release it, so neither would proceed.
+    The pause shares the gate's deferral count, so overlapping holders restore
+    automatic collection only after the last one exits.
+    """
+    with _defer_automatic_gc():
+        yield
+
+
 class _TimedCall:
     def __init__(self, call, eviction, samples, gate):
         import torch
@@ -181,7 +195,7 @@ class _TimedCall:
                 if self.call.reset is not None:
                     self.call.reset()
                 self.producers[index % len(self.producers)]()
-                with self.gate.hold(stream):
+                with _collection_paused(), self.gate.hold(stream):
                     start.record(stream)
                     self.call.invoke()
                     end.record(stream)

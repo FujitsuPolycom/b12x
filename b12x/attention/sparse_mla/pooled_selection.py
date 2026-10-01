@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from b12x.preparation.types import require_prepared
 
@@ -191,6 +192,7 @@ class _CompilePointer:
         return 8 if self.dtype == torch.int64 else 4
 
 
+@program_cache(scope="preparation")
 def compile_pooled_selection(query_payload, ordinal):
     """Compile pooled selection from planned metadata, without cache contents."""
     query = SparseMlaQuery(**dict(query_payload))

@@ -1,5 +1,8 @@
 # Trellis decode table
 
+Status: research-only. CUDA execution, graph replay and performance require
+qualification on the prepared execution path before serving adoption.
+
 Fused W4A16 MoE can decode uniform 2-bit `lut_e4m3` trellis weights with an
 intermediate Hadamard through a 64 KiB table in each thread block's shared
 memory. The table stores the complete codeword-to-E4M3 mapping. It replaces
