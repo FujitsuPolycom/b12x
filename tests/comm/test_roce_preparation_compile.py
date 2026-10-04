@@ -45,14 +45,6 @@ def test_declaration_rejects_nonserializable_dtypes():
         FrozenMapping({"dtypes": (torch.float16,)})
 
 
-def test_unsupported_dtype_fails_alike_whatever_the_spelling():
-    """The launcher boundary raises one ValueError for a torch.dtype or a name."""
-    with pytest.raises(ValueError, match="unsupported RoCE one-shot dtype"):
-        get_launcher(torch.float8_e4m3fn, 2, 0, 32, 4, 4, 1, 0)
-    with pytest.raises(ValueError, match="unsupported RoCE one-shot dtype"):
-        get_launcher("float8_e4m3fn", 2, 0, 32, 4, 4, 1, 0)
-
-
 def test_materialization_does_not_consume_a_shared_program_dictionary(monkeypatch):
     from types import SimpleNamespace
     from b12x.comm.roce import _preparation as module, roce_oneshot
@@ -84,3 +76,11 @@ def test_materialization_does_not_consume_a_shared_program_dictionary(monkeypatc
     assert states[0].gather_launcher is states[1].gather_launcher
     assert states[0].reduce_launchers is not states[1].reduce_launchers
     assert states[0].runtime is runtimes[0] and states[1].runtime is runtimes[1]
+
+
+def test_unsupported_dtype_fails_alike_whatever_the_spelling():
+    """The launcher boundary raises one ValueError for a torch.dtype or a name."""
+    with pytest.raises(ValueError, match="unsupported RoCE one-shot dtype"):
+        get_launcher(torch.float8_e4m3fn, 2, 0, 32, 4, 4, 1, 0)
+    with pytest.raises(ValueError, match="unsupported RoCE one-shot dtype"):
+        get_launcher("float8_e4m3fn", 2, 0, 32, 4, 4, 1, 0)

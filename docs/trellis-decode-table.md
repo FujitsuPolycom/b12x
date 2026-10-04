@@ -40,3 +40,10 @@ random overlapping windows against the compact decoder, including shared
 tables for each supported bit width. Only uniform 2-bit weights use the full
 table in fused MoE; testing the lookup primitive at 3 and 4 bits does not
 enable those execution paths.
+
+A performance comparison must account for instruction scheduling as well as
+table size. The direct intrinsic exposes eight independent byte loads and
+uses byte permutations to pack its results; the compact intrinsic processes
+pairs of windows. Compare an equivalently scheduled compact decoder before
+attributing a speedup solely to the larger table. Record per-launch table
+staging cost, shared-memory usage and end-to-end kernel latency.

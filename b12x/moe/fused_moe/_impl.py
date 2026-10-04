@@ -151,6 +151,7 @@ _W4A16_SCALE_FORMATS = {
     "iq2_xxs": "iq2_xxs",
     "q8_0": "q8_0",
     "e4m3_k16": "e4m3_k16",
+    "e4m3_k16_csf": "e4m3_k16_csf",
     "e4m3_k32": "e4m3_k32",
     "e8m0_k32": "e8m0_k32",
 }
@@ -448,6 +449,14 @@ class B12XFP4ExpertWeights:
     w2_alphas: torch.Tensor
     representation: _PreparedWeightRepresentation | None = None
     immutable_input_scales: bool = False
+    nvfp4_csf: object | None = None
+    # Packed W4A16 representation over the expanded scale scratch, for calls
+    # planned above the stage-scale token limit (nvfp4_csf expands into it).
+    w4a16_expanded: object | None = None
+    mxfp4_csf: object | None = None
+    # W4A16 weights prepared with calibrated activation scales: the opt-in A4
+    # prefill path (B12X_W4A16_A4_PREFILL_MIN_TOKENS) may quantize with them.
+    a4_prefill_scales: bool = False
     _uniform_a1_scale: bool = field(default=False, init=False, repr=False)
     _a1_scale_version: int | None = field(default=None, init=False, repr=False)
 
@@ -999,11 +1008,26 @@ class TPMoEScratchPlan:
         layer_idx: int | None = None,
         route_expert_map: torch.Tensor | None = None,
         output_expert_map: torch.Tensor | None = None,
+        a4_prefill: bool | None = None,
         _w4a16_launches: object | None = None,
     ) -> "TPMoEFP4Binding":
+        """Bind live tensors to this scratch plan.
+
+        ``a4_prefill`` chooses the opt-in A4 prefill of W4A16 plans per call:
+        None applies ``B12X_W4A16_A4_PREFILL_MIN_TOKENS``, True takes it for any
+        call within the prepared capacity, False keeps the call on W4A16. Layers
+        without A4 scales stay W4A16 either way.
+        """
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
-        if experts.plan != self.caps.weight_plan:
+        weight_plan = experts.plan
+        if (
+            weight_plan.w4a16_compressed_scales
+            and not self.caps.weight_plan.w4a16_compressed_scales
+        ):
+            # Calls above the stage-scale token limit run on expanded scales.
+            weight_plan = replace(weight_plan, w4a16_compressed_scales=False)
+        if weight_plan != self.caps.weight_plan:
             raise ValueError(
                 "experts do not match the plan used to size TP MoE scratch"
             )
@@ -1065,6 +1089,7 @@ class TPMoEScratchPlan:
         fused_launch = None
         topk_sum_launch = None
         route_pack_launches = None
+        a4_prefill_launches = None
         if (
             self.caps.quant_mode == "w4a16"
             and not self._core_workspace_plan.full_rotation
@@ -1078,6 +1103,25 @@ class TPMoEScratchPlan:
                 has_route_map=route_expert_map is not None,
                 activation_amax=activation_amax,
             )
+            select_a4 = getattr(_w4a16_launches, "select_a4", None)
+            if select_a4 is not None and experts.a4_prefill_scales:
+                a4_prefill_launches = select_a4(
+                    tokens=int(a.shape[0]), route_ids_dtype=topk_ids.dtype,
+                    has_route_map=(route_expert_map is not None
+                                   or output_expert_map is not None),
+                    activation_amax=activation_amax,
+                    apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
+                    force=a4_prefill,
+                )
+                if a4_prefill_launches is not None:
+                    from b12x.moe._shared.kernels.w4a16.prefill_a4 import a4_prefill_fits
+
+                    if not a4_prefill_fits(
+                        a4_prefill_launches, tokens=int(a.shape[0]),
+                        intermediate_cache13=tensors["intermediate_cache13"],
+                        intermediate_cache2=tensors["intermediate_cache2"],
+                    ):
+                        a4_prefill_launches = None
         elif self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation:
             route_pack_launches = self._prewarmed_route_pack_launches
             tokens = int(a.shape[0])
@@ -1139,6 +1183,7 @@ class TPMoEScratchPlan:
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
+            a4_prefill_launches=a4_prefill_launches,
         )
 
 
@@ -1234,6 +1279,9 @@ class TPMoEFP4Binding:
     fused_launch: object | None = None
     topk_sum_launch: object | None = None
     route_pack_launches: object | None = None
+    # Opt-in NVFP4-activation prefill over the W4A16 packed weights (selected at
+    # bind for calls at or above its token threshold).
+    a4_prefill_launches: object | None = None
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
 
@@ -2824,8 +2872,6 @@ def _heuristic_moe_decode_config(
     )
 
 
-
-
 def _dynamic_task_geometry(
     E: int,
     n: int,
@@ -2943,6 +2989,7 @@ def _build_tp_moe_fp4_binding_from_views(
     fused_launch: object | None = None,
     topk_sum_launch: object | None = None,
     route_pack_launches: object | None = None,
+    a4_prefill_launches: object | None = None,
 ) -> TPMoEFP4Binding:
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
@@ -3145,6 +3192,7 @@ def _build_tp_moe_fp4_binding_from_views(
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
+            a4_prefill_launches=a4_prefill_launches,
         )
 
     if plan.implementation == "micro":
@@ -6625,6 +6673,8 @@ def plan_b12x_fp4_moe_weights(
     num_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    nvfp4_inline_scales: bool = False,
+    w4a16_compressed_scales: bool = False,
     w13_layout: str = "w13",
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
@@ -6653,7 +6703,7 @@ def plan_b12x_fp4_moe_weights(
         )
         for mode in modes
     )
-    return plan_moe_weight_preparation(
+    result = plan_moe_weight_preparation(
         specs,
         num_experts=num_experts,
         hidden_size=hidden_size,
@@ -6666,6 +6716,12 @@ def plan_b12x_fp4_moe_weights(
         trellis_rate_granularity=trellis_rate_granularity,
         trellis_pair_kinds=trellis_pair_kinds,
         intermediate_hadamard_blocks=intermediate_hadamard_blocks,
+    )
+
+    return replace(
+        result,
+        nvfp4_inline_scales=bool(nvfp4_inline_scales),
+        w4a16_compressed_scales=bool(w4a16_compressed_scales),
     )
 
 
@@ -7016,6 +7072,33 @@ def prepare_b12x_fp4_moe_weights(
         w2_alphas=canonical_a2,
         representation=representation,
         immutable_input_scales=immutable_input_scales,
+    )
+
+
+def prepare_b12x_x4t_weights(*, plan, weights) -> B12XFP4ExpertWeights:
+    """Keep exact nibbles and compressed scale planes in the expert owner."""
+    from b12x.moe._shared.kernels.w4a16.prepare import prepare_w4a16_x4t_weights
+
+    unit = torch.ones(plan.num_experts, dtype=torch.float32, device=weights.w13.device)
+    native = WeightPreparationTransform.W4A16_NATIVE in plan.transforms
+    value = prepare_w4a16_x4t_weights(
+        weights.w13, weights.w13_scales, unit,
+        weights.w2, weights.w2_scales, unit,
+        weights.w13_scale_scratch, weights.w2_scale_scratch,
+        activation=plan.activation, params_dtype=getattr(torch, plan.io_dtype),
+        w13_layout=plan.w13_layout,
+        weight_layout="modelopt" if native else "packed",
+    )
+    return B12XFP4ExpertWeights(
+        plan=plan, a1_gscale=unit, a2_gscale=unit,
+        w1_fp4=value.w13, w2_fp4=value.w2,
+        w1_blockscale=value.w13_scale, w2_blockscale=value.w2_scale,
+        w1_alphas=value.w13_global_scale, w2_alphas=value.w2_global_scale,
+        representation=_PreparedWeightRepresentation(
+            quant_mode="w4a16",
+            layout=PreparedWeightLayout.SOURCE_NATIVE if native else PreparedWeightLayout.MMA_PACKED,
+            value=value,
+        ),
     )
 
 
@@ -11040,6 +11123,7 @@ def _get_dynamic_kernel(
     w4a8_repacked: bool = False,
     w4a8_n64_repacked: bool = False,
     nvfp4_materialize_intermediate: bool = False,
+    nvfp4_inline_scales: bool = False,
     direct_routing: bool = False,
     external_route_plan: bool = False,
     share_input_across_experts: bool = False,
@@ -11176,6 +11260,7 @@ def _get_dynamic_kernel(
         bool(materialize_intermediate),
         int(trellis_bits),
         bool(trellis_intermediate_hadamard),
+        *(("nvfp4_inline_scales_v2",) if nvfp4_inline_scales else ()),
     )
     reuse_compiled = _first_env(
         "B12X_DYNAMIC_REUSE_COMPILED",
@@ -11239,6 +11324,8 @@ def _get_dynamic_kernel(
         # "e2m3" FP6 weights); w8a8_mx keeps mxfp6_fmt_a/b unset so the kernel
         # emits the native MmaMXF8Op instead of the inline FP6 MMA.
         kernel_kwargs["quant_recipe"] = quant_mode
+    if nvfp4_inline_scales:
+        kernel_kwargs["nvfp4_inline_scales"] = True
     kernel = activation_spec.make_dynamic_kernel(**kernel_kwargs)
     if is_w4a8:
         launch = _DynamicMoEW4A8Launch(
@@ -11573,6 +11660,7 @@ def _launch_dynamic_flat(
     w4a8_repacked: bool,
     w4a8_n64_repacked: bool,
     nvfp4_materialize_intermediate: bool,
+    nvfp4_inline_scales: bool,
     share_input_across_experts: bool,
     deterministic_output: bool,
     swiglu_limit: float | None,
@@ -11779,6 +11867,7 @@ def _launch_dynamic_flat(
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        nvfp4_inline_scales=nvfp4_inline_scales,
         direct_routing=direct_routing,
         external_route_plan=external_route_plan,
         share_input_across_experts=share_input_across_experts,
@@ -11929,6 +12018,7 @@ def _encode_dynamic_launch_policy(
     planned_direct_routing: bool,
     w4a8_n64_repacked: bool,
     nvfp4_materialize_intermediate: bool = False,
+    nvfp4_inline_scales: bool = False,
 ) -> int:
     try:
         tile_code = _DYNAMIC_TILE_M_POLICY_CODES[int(planned_tile_m)]
@@ -11945,13 +12035,14 @@ def _encode_dynamic_launch_policy(
         | (int(bool(planned_direct_routing)) << 4)
         | (int(bool(w4a8_n64_repacked)) << 5)
         | (int(bool(nvfp4_materialize_intermediate)) << 6)
-        | ((int(policy_max_active_clusters) + 1) << 7)
+        | (int(bool(nvfp4_inline_scales)) << 7)
+        | ((int(policy_max_active_clusters) + 1) << 8)
     )
 
 
 def _decode_dynamic_launch_policy(
     value: int,
-) -> tuple[bool, bool, int, bool, bool, bool, int]:
+) -> tuple[bool, bool, int, bool, bool, bool, bool, int]:
     value = int(value)
     return (
         bool(value & 1),
@@ -11960,7 +12051,8 @@ def _decode_dynamic_launch_policy(
         bool(value & 16),
         bool(value & 32),
         bool(value & 64),
-        (value >> 7) - 1,
+        bool(value & 128),
+        (value >> 8) - 1,
     )
 
 
@@ -12069,6 +12161,7 @@ def _tp_moe_dynamic_launch_op(
         planned_direct_routing,
         w4a8_n64_repacked,
         nvfp4_materialize_intermediate,
+        nvfp4_inline_scales,
         policy_max_active_clusters,
     ) = _decode_dynamic_launch_policy(launch_policy)
     _launch_dynamic_flat(
@@ -12131,6 +12224,7 @@ def _tp_moe_dynamic_launch_op(
         w4a8_repacked=w4a8_repacked,
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        nvfp4_inline_scales=nvfp4_inline_scales,
         share_input_across_experts=share_input_across_experts,
         deterministic_output=deterministic_output,
         swiglu_limit=swiglu_limit,
@@ -12239,6 +12333,7 @@ def _launch_dynamic(
     w4a8_prepared: dict | None = None,
     w4a8_n64_repacked: bool = False,
     nvfp4_materialize_intermediate: bool = False,
+    nvfp4_inline_scales: tuple | None = None,
     share_input_across_experts: bool = False,
     deterministic_output: bool = False,
     swiglu_limit: float | None = None,
@@ -12261,6 +12356,7 @@ def _launch_dynamic(
         planned_direct_routing=dynamic_route_mode == "direct",
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        nvfp4_inline_scales=nvfp4_inline_scales is not None,
     )
     if deterministic_output and workspace.route_output.numel() < routed_rows * k:
         raise RuntimeError(
@@ -12290,6 +12386,8 @@ def _launch_dynamic(
         if weights.dynamic_down_sf is not None
         else weights.down_sf
     )
+    if nvfp4_inline_scales is not None:
+        dynamic_w13_sf, dynamic_down_sf = (p.storage for p in nvfp4_inline_scales)
     torch.ops.b12x.tp_moe_dynamic_launch(
         workspace.packed_a_view,
         workspace.packed_a_flat,
@@ -13033,6 +13131,21 @@ def _finalize_trellis_output(
     return target
 
 
+# Token capacity up to which W4A16 rebuilds NVFP4-CSF scales per pipeline stage.
+# Larger calls are compute bound: expanding the routed experts once costs less
+# there (GLM-5.3 TP2 MoE: stage reads +0.3% at 128 tokens, both +10% at 1536,
+# expansion +3% against stage reads +12% at 8192).
+W4A16_CSF_STAGE_MAX_TOKENS = int(os.environ.get("B12X_W4A16_CSF_STAGE_MAX_TOKENS", "1536"))
+
+
+def _w4a16_reads_stage_scales(binding, tokens: int) -> bool:
+    """Whether this W4A16 call reads compressed scales per stage (its planned launch's format)."""
+    launch = getattr(binding, "fused_launch", None)
+    if launch is not None:
+        return getattr(launch, "scale_format", None) == "e4m3_k16_csf"
+    return int(tokens) <= W4A16_CSF_STAGE_MAX_TOKENS
+
+
 def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     """Execute one fully planned, prepared, and scratch-bound FP4 MoE launch."""
     if not isinstance(binding, TPMoEFP4Binding):
@@ -13083,6 +13196,45 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     w2_alphas = experts.w2_alphas
     topk_weights = binding.topk_weights
     topk_ids = binding.topk_ids
+    if experts.mxfp4_csf is not None:
+        experts.mxfp4_csf.decode(topk_ids, w1_blockscale, w2_blockscale)
+    # The A4 prefill path (when present) reads expanded (W4A16-layout) scales.
+    stage_scales = (
+        experts.w4a16_expanded is not None
+        and getattr(binding, "a4_prefill_launches", None) is None
+        and _w4a16_reads_stage_scales(binding, topk_ids.shape[0])
+    )
+    csf_reset_barriers = (
+        experts.nvfp4_csf is not None
+        and not stage_scales
+        and binding.implementation == "micro"
+        and topk_ids.numel() > 0
+    )
+    inline_scales = None
+    if (
+        experts.nvfp4_csf is not None
+        and binding.implementation == "dynamic"
+        and binding.quant_mode == "nvfp4"
+        and plan.decode_config.nvfp4_inline_scales
+    ):
+        inline_scales = experts.nvfp4_csf.inline_scales
+    if experts.nvfp4_csf is not None and inline_scales is None and not stage_scales:
+        barriers = (
+            (
+                _require_binding_field(binding, "barrier_count"),
+                _require_binding_field(binding, "barrier_epoch"),
+            )
+            if csf_reset_barriers
+            else None
+        )
+        # W4A16 compressed storage expands into its shared scratch, not in place.
+        expanded = experts.w4a16_expanded
+        experts.nvfp4_csf.decode(
+            topk_ids,
+            w1_blockscale if expanded is None else expanded.w13_scale,
+            w2_blockscale if expanded is None else expanded.w2_scale,
+            barriers=barriers,
+        )
     workspace = None
     apply_router_weight_on_input = binding.apply_router_weight_on_input
     output = binding.output
@@ -13104,10 +13256,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     if binding.implementation == "micro":
         workspace = TPMicroWorkspace(
             implementation=binding.implementation,
-            # Eager-bind maps views only and no longer zeros the read-before-write
-            # barrier scalars; the launch wrapper must re-zero them in-place each
-            # call (gated on volatile_launch_state), like the W4A16 path.
-            volatile_launch_state=True,
+            # CSF expansion initializes these scalars in its preceding kernel.
+            # Other weights retain the launch wrapper's scalar initialization.
+            volatile_launch_state=not csf_reset_barriers,
             quant_mode=quant_mode,
             state_E=binding.state_E,
             weight_E=binding.weight_E,
@@ -13266,6 +13417,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
 
         prepared = prepared_payload
+        if experts.w4a16_expanded is not None and not stage_scales:
+            prepared = experts.w4a16_expanded
         if prepared is None:
             raise RuntimeError(
                 "the W4A16 weight plan did not materialize its required representation"
@@ -13332,6 +13485,18 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                     "CUDA graph capture requires contiguous W4A16 topk_ids"
                 )
             topk_ids = topk_ids.contiguous()
+        a4_launches = binding.a4_prefill_launches
+        if a4_launches is not None:
+            # Bind admitted this call (token threshold, scratch fit, plain routing).
+            from b12x.moe._shared.kernels.w4a16.prefill_a4 import run_w4a16_a4_prefill
+
+            return run_w4a16_a4_prefill(
+                a, prepared, topk_weights, topk_ids,
+                a1_gscale=a1_gscale, a2_gscale=a2_gscale,
+                intermediate_cache13=intermediate_cache13,
+                intermediate_cache2=intermediate_cache2,
+                output=scatter_output, launches=a4_launches,
+            )
         result = run_w4a16_moe(
             a,
             prepared,
@@ -13380,7 +13545,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 else None
             ),
             route_mode=(
-                "packed" if binding.route_pack_launches is not None
+                "packed"
+                if binding.route_pack_launches is not None
                 else plan.decode_config.w4a16_route_mode or "auto"
             ),
         )
@@ -13534,7 +13700,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     if compact_w4a8_micro:
         compact = binding.compact_launches
         if compact is None:
-            raise RuntimeError("compact W4A8 execution requires its prepared native launchers")
+            raise RuntimeError(
+                "compact W4A8 execution requires its prepared native launchers"
+            )
         from b12x.moe._shared.kernels.w4a8_compact_micro import (
             launch_w4a8_compact_micro,
         )
@@ -13561,14 +13729,23 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             fast_math=fast_math,
         )
         from b12x.moe._shared.kernels.w4a16.kernel import _w4a16_topk_sum_launch_flat
+
         _w4a16_topk_sum_launch_flat(
-            route_output, scatter_output, m, num_topk, k, "bf16", int(stream),
+            route_output,
+            scatter_output,
+            m,
+            num_topk,
+            k,
+            "bf16",
+            int(stream),
             launcher=compact.topk_sum,
         )
         return scatter_output
 
     if impl == "dynamic":
-        if plan.decode_config.nvfp4_share_input and not experts.can_share_input(input_scales_static=True):
+        if plan.decode_config.nvfp4_share_input and not experts.can_share_input(
+            input_scales_static=True
+        ):
             raise ValueError("input scales changed after shared-input preparation")
         deterministic_output = plan.deterministic_output
         decode_config = plan.decode_config
@@ -13628,6 +13805,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             activation=activation,
             quant_mode=quant_mode,
             w4a8_prepared=dynamic_w4a8_prepared,
+            nvfp4_inline_scales=inline_scales,
             w4a8_n64_repacked=bool(getattr(prepared_payload, "n64_repack", False)),
             nvfp4_materialize_intermediate=decode_config.nvfp4_materialize_intermediate,
             deterministic_output=deterministic_output,
@@ -13644,10 +13822,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             planned_num_tokens=plan.routed_rows // plan.num_topk,
             dynamic_route_mode=decode_config.dynamic_route_mode or "",
             share_input_across_experts=(
-                (
-                    quant_mode == "nvfp4"
-                    and decode_config.nvfp4_share_input
-                )
+                (quant_mode == "nvfp4" and decode_config.nvfp4_share_input)
                 or (
                     dynamic_w4a8_prepared is not None
                     and _env_flag(
